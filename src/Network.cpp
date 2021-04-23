@@ -1158,45 +1158,40 @@ Network::Netresult Network::get_output_internal(
     // ln(x) = log2(x) * ln(2)
     const auto beta_nat_tune = cfg_betatune * 0.69314718056;
 
-    if (m_value_head_type==DOUBLE_V) {
-        // If double head value, also get beta
-        batchnorm<NUM_INTERSECTIONS>(m_vbe_outputs, vbe_data,
-                    m_bn_vbe_w1.data(), m_bn_vbe_w2.data());
-        const auto vbe_channels =
-            innerproduct<true>(vbe_data, m_ip1_vbe_w, m_ip1_vbe_b);
-        const auto vbe_output =
-            innerproduct<false>(vbe_channels, m_ip2_vbe_w, m_ip2_vbe_b);
-
-        result.alpha = val_output[0];
-        result.beta = std::exp(vbe_output[0] + beta_nat_tune) * 10.0f / NUM_INTERSECTIONS;
-        result.is_sai = true;
-    } else if (m_value_head_type==DOUBLE_Y) {
-        const auto vbe_channels =
-            innerproduct<true>(val_data, m_ip1_vbe_w, m_ip1_vbe_b);
-        const auto vbe_output =
-            innerproduct<false>(vbe_channels, m_ip2_vbe_w, m_ip2_vbe_b);
-
-        result.alpha = val_output[0];
-        result.beta = std::exp(vbe_output[0] + beta_nat_tune) * 10.0f / NUM_INTERSECTIONS;
-        result.is_sai = true;
-    } else if (m_value_head_type==DOUBLE_T) {
-        const auto vbe_output =
-            innerproduct<false>(val_channels, m_ip2_vbe_w, m_ip2_vbe_b);
-        result.alpha = val_output[0];
-        result.beta = std::exp(vbe_output[0] + beta_nat_tune) * 10.0f / NUM_INTERSECTIONS;
-        result.is_sai = true;
-    } else if (m_value_head_type==DOUBLE_I) {
-        result.alpha = val_output[0];
-        result.beta = std::exp(val_output[1] + beta_nat_tune) * 10.0f / NUM_INTERSECTIONS;
-        result.is_sai = true;
-    } else if (m_value_head_type==SINGLE) {
+    if (m_value_head_type==SINGLE) {
         result.alpha = 2 * val_output[0]; // logits of the winrate for LZ networks
         result.beta = 1.0f; // conventional value
         result.value = sigmoid(result.alpha, 1, 0).first;
         result.is_sai = false;
-    }
+    } else {
+        if (m_value_head_type==DOUBLE_V) {
+            // If double head value, also get beta
+            batchnorm<NUM_INTERSECTIONS>(m_vbe_outputs, vbe_data,
+                                         m_bn_vbe_w1.data(), m_bn_vbe_w2.data());
+            const auto vbe_channels =
+                innerproduct<true>(vbe_data, m_ip1_vbe_w, m_ip1_vbe_b);
+            const auto vbe_output =
+                innerproduct<false>(vbe_channels, m_ip2_vbe_w, m_ip2_vbe_b);
 
-    if (result.is_sai) {
+            result.beta = vbe_output[0];
+        } else if (m_value_head_type==DOUBLE_Y) {
+            const auto vbe_channels =
+                innerproduct<true>(val_data, m_ip1_vbe_w, m_ip1_vbe_b);
+            const auto vbe_output =
+                innerproduct<false>(vbe_channels, m_ip2_vbe_w, m_ip2_vbe_b);
+
+            result.beta = vbe_output[0];
+        } else if (m_value_head_type==DOUBLE_T) {
+            const auto vbe_output =
+                innerproduct<false>(val_channels, m_ip2_vbe_w, m_ip2_vbe_b);
+            result.beta = vbe_output[0];
+        } else if (m_value_head_type==DOUBLE_I) {
+            result.beta = val_output[1];
+        }
+
+        result.alpha = val_output[0];
+        result.beta = std::exp(result.beta + beta_nat_tune) * 10.0f / NUM_INTERSECTIONS;
+        result.is_sai = true;
         const auto komi = state->get_komi_adj();
         const auto white = (FastBoard::WHITE == state->get_to_move());
         result.value = sigmoid(result.alpha, result.beta, white ? komi : -komi).first;
