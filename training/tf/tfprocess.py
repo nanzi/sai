@@ -113,11 +113,11 @@ class Timer:
         return e
 
 class TFProcess:
-    def __init__(self, residual_blocks, residual_filters,
+    def __init__(self, resconv_blocks, residual_filters,
                  s_rate, s_minsteps, s_steps, s_maxsteps, s_maxkeep,
-                 s_policyloss, s_mseloss, s_kleloss, s_axbloss, s_regloss, s_beta_scale):
+                 s_policyloss, s_mseloss, s_kleloss, s_axbloss, s_regloss, s_betascale, s_plc):
         # Network structure
-        self.residual_blocks = residual_blocks
+        self.resconv_blocks = resconv_blocks
         self.residual_filters = residual_filters
 
         # model type: full precision (fp32) or mixed precision (fp16)
@@ -148,7 +148,8 @@ class TFProcess:
         self.kle_loss_wt = s_kleloss
         self.axb_loss_wt = s_axbloss
         self.reg_loss_wt = s_regloss
-        self.beta_scale = s_beta_scale
+        self.beta_scale = s_betascale
+        self.pol_layer_calib = s_plc
 
         # Output weight file with averaged weights
         self.swa_enabled = False
@@ -175,6 +176,7 @@ class TFProcess:
     def init(self, batch_size, macrobatch=1, gpus_num=None, logbase='leelalogs'):
         self.batch_size = batch_size
         self.macrobatch = macrobatch
+        self.train_rate /= self.macrobatch
         self.logbase = logbase
         # Input batch placeholders
         self.planes = tf.placeholder(tf.string, name='in_planes')
@@ -219,6 +221,7 @@ class TFProcess:
 
         # You need to change the learning rate here if you are training
         # from a self-play training set, for example start with 0.005 instead.
+        print(f'Debug: learning rate {self.train_rate}')
         opt = tf.train.MomentumOptimizer(
             learning_rate=self.train_rate, momentum=0.9, use_nesterov=True)
 
@@ -332,6 +335,9 @@ class TFProcess:
         self.test_writer = tf.summary.FileWriter(
             os.path.join(os.getcwd(),
                          self.logbase + "/test"), self.session.graph)
+        self.trset_test_writer = tf.summary.FileWriter(
+            os.path.join(os.getcwd(),
+                         self.logbase + "/trset_test"), self.session.graph)
         self.train_writer = tf.summary.FileWriter(
             os.path.join(os.getcwd(),
                          self.logbase + "/train"), self.session.graph)
@@ -359,50 +365,103 @@ class TFProcess:
             average_grads.append(grad_and_var)
         return average_grads
 
-    def tower_loss(self, x, komi, y_, z_, u_, v_):
-        y_conv, z_conv, u_conv = self.construct_net(x, komi)  # policy, win-log-odds, alpha, beta
+    def get_halflogits(self, alpha, halfbeta, komi):
+        x = alpha + komi
+        if VBE_NUM == 1:
+            return halfbeta * x
+        else:
+            return tf.reduce_sum(halfbeta * np.array([-1,1], ndmin=2) \
+                    * tf.nn.relu(x * np.array([-1,1], ndmin=2)), axis=-1, keepdims=True)
+
+    def tower_loss(self, x, komi, policy_dt, outcome_dt, alpha_dt, beta_dt):
+        # policylogits_nn, alpha_nn, halfbeta_nn = self.construct_net(x, komi)  # policy, win-log-odds, alpha, beta
+        policylogits_nn, alpha_nn, halfbeta_nn = self.construct_net(x, komi)  # policy, alpha, beta/2
 
         # Cast the nn result back to fp32 to avoid loss overflow/underflow
         if self.model_dtype != tf.float32:
-            y_conv = tf.cast(y_conv, tf.float32)
-            z_conv = tf.cast(z_conv, tf.float32)
-            u_conv = tf.cast(u_conv, tf.float32)
+            policylogits_nn = tf.cast(policylogits_nn, tf.float32)
+            alpha_nn = tf.cast(alpha_nn, tf.float32)
+            halfbeta_nn = tf.cast(halfbeta_nn, tf.float32)
 
         # Calculate loss on policy head
         cross_entropy = \
-            tf.nn.softmax_cross_entropy_with_logits(labels=y_,
-                                                    logits=y_conv)
-        policy_loss = tf.reduce_mean(cross_entropy)
+            tf.nn.softmax_cross_entropy_with_logits_v2(labels=policy_dt,
+                                                       logits=policylogits_nn)
+        visits_base_entropy = -tf.reduce_mean(tf.reduce_sum(tf.math.xlogy(policy_dt, policy_dt), axis=-1))
+        policy_loss = tf.reduce_mean(cross_entropy) - visits_base_entropy
 
-        # Loss on value head
-        winrate_conv = tf.nn.tanh(z_conv)
-        mse_loss = \
-            tf.reduce_mean(tf.squared_difference(z_, winrate_conv))
+        loss = self.policy_loss_wt * policy_loss # first term, always present
+
 
         # Regularizer
         reg_variables = tf.get_collection(tf.GraphKeys.WEIGHTS)
         reg_term = self.l2_scale * tf.add_n(
             [tf.cast(tf.nn.l2_loss(v), tf.float32) for v in reg_variables])
 
-        # For training from a (smaller) dataset of strong players, you will
-        # want to reduce the factor in front of self.mse_loss here.
-        loss = self.policy_loss_wt * policy_loss \
-               + self.mse_loss_wt * mse_loss \
-               + self.reg_loss_wt * reg_term
+        if self.reg_loss_wt > 0.0:
+            loss += self.reg_loss_wt * reg_term
+
+        # Losses on value head: MSE, KLE, AXB
+
+        # MSE (quadratic) loss on value
+
+        # Every data point is split in two. If the komi is not integer this has no effect
+        # as 'low' and 'high' are always identical to the original values.
+        # If the komi is integer, and the game is not jigo, 'low' and 'high' are identical
+        # but the komi is corrected by half point in the direction in which the result
+        # would eventually change, to improve the sharpness of the data point itself.
+        # If the komi is integer, and the game is jigo, 'low' and 'high' are different
+        # data points, with komi shifted by plus/minus 0.5 and outcome win/lose, again, to
+        # improve the sharpness of the data point.
+        # This enhancement improves beta in end game positions greatly.
+        
+        eps = 0.05
+        k = 0.25
+        komi_low = tf.math.floor(komi - eps - k * outcome_dt) + 0.5
+        komi_high = tf.math.floor(komi + eps - k * outcome_dt) + 0.5
+        outcome_dt_low = tf.math.sign(outcome_dt - k)
+        outcome_dt_high = tf.math.sign(outcome_dt + k)
+        halflogits_nn = self.get_halflogits(alpha_nn, halfbeta_nn, komi)
+        halflogits_nn_low = self.get_halflogits(alpha_nn, halfbeta_nn, komi_low)
+        halflogits_nn_high = self.get_halflogits(alpha_nn, halfbeta_nn, komi_high)
+        outcome_nn = tf.nn.tanh(halflogits_nn)
+        outcome_nn_low = tf.nn.tanh(halflogits_nn_low)
+        outcome_nn_high = tf.nn.tanh(halflogits_nn_high)
+        mse_loss = \
+            0.5 * tf.reduce_mean(tf.squared_difference(outcome_dt_low, outcome_nn_low)) + \
+            0.5 * tf.reduce_mean(tf.squared_difference(outcome_dt_high, outcome_nn_high))
+
+        # winrate_conv = tf.nn.tanh(alpha_nn)
+        # mse_loss = \
+        #     tf.reduce_mean(tf.squared_difference(outcome_dt, winrate_conv))
+
+        if self.mse_loss_wt > 0.0:
+            loss += self.mse_loss_wt * mse_loss
 
         # KL loss on value
-        winrate = (z_ + 1.0) / 2.0
+        winrate_dt_low = (outcome_dt_low + 1.0) / 2.0
+        winrate_dt_high = (outcome_dt_high + 1.0) / 2.0
         win_cross_entropy = \
-            tf.nn.sigmoid_cross_entropy_with_logits(labels = winrate,
-                                                    logits = 2 * z_conv)
+            0.5 * tf.nn.sigmoid_cross_entropy_with_logits(labels = winrate_dt_low,
+                                                          logits = 2 * halflogits_nn_low) + \
+            0.5 * tf.nn.sigmoid_cross_entropy_with_logits(labels = winrate_dt_high,
+                                                          logits = 2 * halflogits_nn_high)
+        # winrate = (outcome_dt + 1.0) / 2.0
+        # win_cross_entropy = \
+        #     tf.nn.sigmoid_cross_entropy_with_logits(labels = winrate,
+        #                                             logits = 2 * alpha_nn)
+
         kle_loss = 2.0 * tf.reduce_mean(win_cross_entropy)
         if self.kle_loss_wt > 0.0:
             loss += self.kle_loss_wt * kle_loss
 
         # Loss on alpha*beta
-        axb_diff = tf.multiply(v_, tf.math.subtract(u_, u_conv))
+        axb_diff = tf.multiply(beta_dt, tf.math.subtract(alpha_dt, alpha_nn))
         axb_loss = self.axb_scale \
                    * (tf.reduce_mean(tf.math.softplus(2 * axb_diff) - axb_diff) - tf.math.softplus(0.0))
+        # axb_diff = ( 1.0 - outcome_nn * outcome_nn ) * halfbeta_nn * ( alpha_dt - alpha_nn )
+        # axb_loss = self.axb_scale * tf.reduce_mean( axb_diff * axb_diff )
+
         if self.axb_loss_wt > 0.0:
             loss += self.axb_loss_wt * axb_loss
 
@@ -410,14 +469,15 @@ class TFProcess:
         # 'w_fc_1' is the 722x362 matrix of weights of the dense layer in the policy head
         # By attracting it to plttarget matrix, we enforce the calibration of the 1x1 conv layer
         # This should help all the tower.
-        if PLC_COEFF > 0.0:
+        if self.pol_layer_calib > 0.0:
+            print("Policy layer calibration active with coefficient {}".format(self.pol_layer_calib))
             w_fc1 = [v for v in tf.trainable_variables() if v.name == "fp32_storage/w_fc_1:0"][0]
             pltarget = 0.5 * tf.concat([tf.eye(BOARD_SQUARES,1+BOARD_SQUARES),tf.eye(BOARD_SQUARES,1+BOARD_SQUARES)],axis=0)    
             plc_term = self.l2_scale * tf.nn.l2_loss(w_fc1 - pltarget)
-            loss += self.reg_loss_wt * PLC_COEFF * plc_term
-            reg_term += PLC_COEFF * plc_term   # this is done to see the term inside regularization
+            loss += self.reg_loss_wt * self.pol_layer_calib * plc_term
+            reg_term += self.pol_layer_calib * plc_term   # this is done to see the term inside regularization
         
-        return loss, policy_loss, mse_loss, kle_loss, axb_loss, reg_term, y_conv
+        return loss, policy_loss, mse_loss, kle_loss, axb_loss, reg_term, policylogits_nn
 
     def assign(self, var, values):
         try:
@@ -521,65 +581,72 @@ class TFProcess:
                     tf.Summary(value=summaries), steps)
                 stats.clear()
 
-            if n >= self.min_steps and (n - self.min_steps) % self.train_steps == 0:
-                test_stats = Stats()
-                test_batches = 800 # reduce sample mean variance by ~28x
-                print("Computing validation loss and saving weights.")
-                for _ in range(0, test_batches):
-                    test_batch = next(test_data)
-                    losses = self.measure_loss(test_batch, training=False)
-                    test_stats.add(losses)
-                summaries = test_stats.summaries({'Policy Loss': 'policy',
-                                                  'MSE Loss': 'mse',
-                                                  'KLE Loss': 'kle',
-                                                  'Alpha*Beta Loss': 'axb',
-                                                  'Accuracy': 'accuracy'})
-                self.test_writer.add_summary(tf.Summary(value=summaries), steps)
-                print("step {}, policy={:g} training accuracy={:g}%, mse={:g}, kle={:g}, axb={:g}".\
-                    format(steps, test_stats.mean('policy'),
-                        test_stats.mean('accuracy')*100.0,
-                        test_stats.mean('mse'),
-                        test_stats.mean('kle'),
-                        test_stats.mean('axb')))
+                if n % (10 * info_steps) == 0:
+                    print('Computing validation loss...')
+                    val_stats = Stats()
+                    val_batches = info_steps
+                    for _ in range(0, val_batches):
+                        val_batch = next(test_data)
+                        losses = self.measure_loss(val_batch, training=False)
+                        val_stats.add(losses)
+                    summaries = val_stats.summaries({'Policy Loss': 'policy',
+                                                     'MSE Loss': 'mse',
+                                                     'KLE Loss': 'kle',
+                                                     'Alpha*Beta Loss': 'axb',
+                                                     'Accuracy': 'accuracy'})
+                    self.test_writer.add_summary(tf.Summary(value=summaries), steps)
+                    print("step {}, policy={:g} training accuracy={:g}%, mse={:g}, kle={:g}, axb={:g}".\
+                          format(steps, val_stats.mean('policy'),
+                                 val_stats.mean('accuracy')*100.0,
+                                 val_stats.mean('mse'),
+                                 val_stats.mean('kle'),
+                                 val_stats.mean('axb')))
+                    val_stats.clear()
+                    if USE_TRAINSET_TEST:
+                        for _ in range(0, val_batches):
+                            val_batch = next(train_data)
+                            losses = self.measure_loss(val_batch, training=False)
+                            val_stats.add(losses)
+                        summaries = val_stats.summaries({'Policy Loss': 'policy',
+                                                         'MSE Loss': 'mse',
+                                                         'KLE Loss': 'kle',
+                                                         'Alpha*Beta Loss': 'axb',
+                                                         'Accuracy': 'accuracy'})
+                        self.trset_test_writer.add_summary(tf.Summary(value=summaries), steps)
+                        print("step {}, policy={:g} training accuracy={:g}%, mse={:g}, kle={:g}, axb={:g}".\
+                              format(steps, val_stats.mean('policy'),
+                                     val_stats.mean('accuracy')*100.0,
+                                     val_stats.mean('mse'),
+                                     val_stats.mean('kle'),
+                                     val_stats.mean('axb')))
+                        val_stats.clear()
 
-                # Write out current model and checkpoint
-                path = os.path.join(os.getcwd(), "leelaz-model")
-                save_path = self.saver.save(self.session, path,
-                                            global_step=steps)
-                print("Model saved in file: {}".format(save_path))
-                leela_path = path + "-" + str(steps) + ".txt"
-                self.save_leelaz_weights(leela_path)
-                print("SAI weights saved to {}".format(leela_path))
-                # Things have likely changed enough
-                # that stats are no longer valid.
+                    if (n >= self.min_steps and (n - self.min_steps) % self.train_steps == 0) \
+                       or os.path.exists('request-save-model'):
+                        print("Saving model...")
+                        # Write out current model and checkpoint
+                        path = os.path.join(os.getcwd(), "leelaz-model")
+                        save_path = self.saver.save(self.session, path,
+                                                    global_step=steps)
+                        print("Model saved in file: {}".format(save_path))
+                        print("Saving weights...")
+                        leela_path = path + "-" + str(steps) + ".txt"
+                        self.save_leelaz_weights(leela_path)
+                        print("SAI weights saved to {}".format(leela_path))
+                        # Things have likely changed enough
+                        # that stats are no longer valid.
 
-                if self.swa_enabled:
-                    self.save_swa_network(steps, path, leela_path, train_data)
+                        if self.swa_enabled:
+                            self.save_swa_network(steps, path, leela_path, train_data)
 
-                    save_path = self.saver.save(self.session, path,
-                                                global_step=steps)
-                    print("Model saved in file: {}".format(save_path))
+                            save_path = self.saver.save(self.session, path,
+                                                        global_step=steps)
+                            print("Model saved in file: {}".format(save_path))
 
-            elif n % (10 * info_steps) == 0:
-                val_stats = Stats()
-                val_batches = info_steps
-                for _ in range(0, val_batches):
-                    val_batch = next(test_data)
-                    losses = self.measure_loss(val_batch, training=False)
-                    val_stats.add(losses)
-                summaries = val_stats.summaries({'Policy Loss': 'policy',
-                                                  'MSE Loss': 'mse',
-                                                  'KLE Loss': 'kle',
-                                                  'Alpha*Beta Loss': 'axb',
-                                                  'Accuracy': 'accuracy'})
-                self.test_writer.add_summary(tf.Summary(value=summaries), steps)
-                print("step {}, policy={:g} training accuracy={:g}%, mse={:g}, kle={:g}, axb={:g}".\
-                    format(steps, val_stats.mean('policy'),
-                        val_stats.mean('accuracy')*100.0,
-                        val_stats.mean('mse'),
-                        val_stats.mean('kle'),
-                        val_stats.mean('axb')))
-                val_stats.clear()
+                        if os.path.exists('request-save-model'):
+                            print("Stopping.")
+                            os._exit(0)
+
 
         print("Finished.")
         os._exit(0)
@@ -589,16 +656,28 @@ class TFProcess:
             # Version tag
             file.write(WEIGHTS_FILE_VER)
             for weights in self.weights:
-                # Newline unless last line (single bias)
-                file.write("\n")
                 work_weights = None
-                if weights.name.endswith('/batch_normalization/beta:0'):
+                if weights.name.endswith('/batch_normalization/gamma:0'):
+                    continue
+                elif weights.name.endswith('/batch_normalization/beta:0'):
                     # Batch norm beta needs to be converted to biases before
                     # the batch norm for backwards compatibility reasons
                     var_key = weights.name.replace('beta', 'moving_variance')
                     var = tf.get_default_graph().get_tensor_by_name(var_key)
-                    work_weights = tf.multiply(weights,
-                                               tf.sqrt(var + tf.constant(1e-5)))
+                    gamma_key = weights.name.replace('beta', 'gamma')
+                    try:
+                        gamma = tf.get_default_graph().get_tensor_by_name(gamma_key)
+                    except KeyError:
+                        gamma = 1.0
+                    work_weights = tf.divide(tf.multiply(weights, tf.sqrt(var + tf.constant(1e-5))),
+                                             gamma)
+                elif weights.name.endswith('/batch_normalization/moving_variance:0'):
+                    gamma_key = weights.name.replace('moving_variance', 'gamma')
+                    try:
+                        gamma = tf.get_default_graph().get_tensor_by_name(gamma_key)
+                    except KeyError:
+                        gamma = 1.0
+                    work_weights = tf.divide(weights, tf.square(gamma + tf.constant(1e-5)))
                 elif weights.shape.ndims == 4:
                     # Convolution weights need a transpose
                     #
@@ -619,7 +698,20 @@ class TFProcess:
                     work_weights = weights
                 nparray = work_weights.eval(session=self.session)
                 wt_str = [str(wt) for wt in np.ravel(nparray)]
+                # Newline unless last line (single bias)
+                file.write("\n")
                 file.write(" ".join(wt_str))
+
+    def save_gamma_weights(self, filename):
+        with open(filename, "w") as file:
+            for weights in self.weights:
+                if not weights.name.endswith('/batch_normalization/gamma:0'):
+                    continue
+                nparray = weights.eval(session=self.session)
+                wt_str = [str(wt) for wt in np.ravel(nparray)]
+                # Newline unless last line (single bias)
+                file.write(" ".join(wt_str))
+                file.write("\n")
 
     def get_batchnorm_key(self):
         result = "bn" + str(self.batch_norm_count)
@@ -639,7 +731,7 @@ class TFProcess:
             assert var.dtype.base_dtype == tf.float32
             self.weights.append(var)
 
-    def batch_norm(self, net):
+    def batch_norm(self, net, scale=False):
         # The weights are internal to the batchnorm layer, so apply
         # a unique scope that we can store, and use to look them back up
         # later on.
@@ -649,16 +741,58 @@ class TFProcess:
             net = tf.layers.batch_normalization(
                     net,
                     epsilon=1e-5, axis=1, fused=True,
-                    center=True, scale=False,
+                    center=True, scale=scale,
                     training=self.training,
                     reuse=self.reuse_var)
 
-        for v in ['beta', 'moving_mean', 'moving_variance' ]:
+        weight_vars = ['beta', 'moving_mean', 'moving_variance' ]
+        if scale:
+            weight_vars += ['gamma']
+        for v in weight_vars:
             name = "fp32_storage/" + scope + '/batch_normalization/' + v + ':0'
             var = tf.get_default_graph().get_tensor_by_name(name)
             self.add_weights(var)
 
         return net
+
+    def dense_block(self, inputs, input_channels, output_channels, name,
+                    bias=True, relu=True, batch_norm=False):
+        W_fc = weight_variable("w_" + name,
+                               [input_channels, output_channels],
+                               self.model_dtype)
+        self.add_weights(W_fc)
+        h_fc = tf.matmul(inputs, W_fc)
+
+        if bias and not batch_norm:
+            b_fc = bias_variable("b_" + name, [output_channels], self.model_dtype)
+            self.add_weights(b_fc)
+            h_fc = tf.add(h_fc, b_fc)
+
+        if batch_norm:
+            h_fc = self.batch_norm(h_fc)
+
+        if relu:
+            h_fc = tf.nn.relu(h_fc)
+
+        return h_fc
+
+    def resdense_block(self, inputs, channels, name):
+        W_fc1 = weight_variable("w1_" + name, [channels, channels],
+                                self.model_dtype)
+        self.add_weights(W_fc1)
+        h_fc = tf.matmul(inputs, W_fc1)
+        h_fc = self.batch_norm(h_fc)
+        h_fc = tf.nn.relu(h_fc)
+
+        W_fc2 = weight_variable("w2_" + name, [channels, channels],
+                                self.model_dtype)
+        self.add_weights(W_fc2)
+        h_fc = tf.matmul(h_fc, W_fc2)
+        h_fc = self.batch_norm(h_fc, scale=RESIDUAL_BN_SCALE)
+        h_fc = tf.add(h_fc, inputs)
+        h_fc = tf.nn.relu(h_fc)
+
+        return h_fc
 
     def conv_block(self, inputs, filter_size, input_channels, output_channels, name):
         W_conv = weight_variable(
@@ -674,12 +808,12 @@ class TFProcess:
         net = tf.nn.relu(net)
         return net
 
-    def residual_block(self, inputs, channels, name):
+    def resconv_block(self, inputs, channels, name, filter_size=3):
         net = inputs
         orig = tf.identity(net)
 
         # First convnet weights
-        W_conv_1 = weight_variable(name + "_conv_1", [3, 3, channels, channels],
+        W_conv_1 = weight_variable(name + "_conv_1", [filter_size, filter_size, channels, channels],
                                    self.model_dtype)
         self.add_weights(W_conv_1)
 
@@ -688,12 +822,12 @@ class TFProcess:
         net = tf.nn.relu(net)
 
         # Second convnet weights
-        W_conv_2 = weight_variable(name + "_conv_2", [3, 3, channels, channels],
+        W_conv_2 = weight_variable(name + "_conv_2", [filter_size, filter_size, channels, channels],
                                    self.model_dtype)
         self.add_weights(W_conv_2)
 
         net = conv2d(net, W_conv_2)
-        net = self.batch_norm(net)
+        net = self.batch_norm(net, scale=RESIDUAL_BN_SCALE)
         net = tf.add(net, orig)
         net = tf.nn.relu(net)
 
@@ -711,101 +845,148 @@ class TFProcess:
                                output_channels=self.residual_filters,
                                name="first_conv")
         # Residual tower
-        for i in range(0, self.residual_blocks):
+        for i in range(0, self.resconv_blocks):
             block_name = "res_" + str(i)
-            flow = self.residual_block(flow, self.residual_filters,
+            flow = self.resconv_block(flow, self.residual_filters,
                                        name=block_name)
 
+        # POLICY
+
+        policy_flow = flow
+
+        # Policy blocks (optional)
+        for i in range(0, POLICY_BLOCKS):
+            block_inputs = POLICY_CHANNELS if i > 0 else self.residual_filters
+            block_outputs = POLICY_CHANNELS
+            if block_inputs != block_outputs:
+                block_name = "policy_conv_" + str(i)
+                print("Block {} inputs {} outputs {}".format(block_name, block_inputs, block_outputs))
+                policy_flow = self.conv_block(policy_flow, filter_size=1,
+                                              input_channels=block_inputs,
+                                              output_channels=block_outputs,
+                                              name=block_name)
+            else:
+                block_name = "policy_res_" + str(i)
+                print("Block {} outputs {}".format(block_name, block_outputs))
+                policy_flow = self.resconv_block(policy_flow, block_outputs, filter_size=1,
+                                                  name=block_name)
+
         # Policy head
-        conv_pol = self.conv_block(flow, filter_size=1,
-                                   input_channels=self.residual_filters,
+        block_inputs = POLICY_CHANNELS if POLICY_BLOCKS > 0 else self.residual_filters
+        conv_pol = self.conv_block(policy_flow, filter_size=1,
+                                   input_channels=block_inputs,
                                    output_channels=POLICY_OUTPUTS,
                                    name="policy_head")
         h_conv_pol_flat = tf.reshape(conv_pol, [-1, POLICY_OUTPUTS * BOARD_SQUARES])
 
         POLICY_DENSE_INPUTS = POLICY_OUTPUTS * BOARD_SQUARES
-        # in the case of policy dependent komi, append subjective komi
-        if WEIGHTS_FILE_VER == "49":
-            # layer 1 of komi policy
-            W_kpl1 = weight_variable("w_kpl_1",[POLICY_DENSE_INPUTS + 1, KOMI_POLICY_CHANS], self.model_dtype)
-            b_kpl1 = bias_variable("b_kpl_1",[KOMI_POLICY_CHANS], self.model_dtype)
-            self.add_weights(W_kpl1)
-            self.add_weights(b_kpl1)
-            h_kpl1 = tf.nn.relu(tf.add(tf.matmul(tf.concat([h_conv_pol_flat, x_komi], 1), W_kpl1), b_kpl1))
 
-            # layer2 of komi policy
-            W_kpl2 = weight_variable("w_kpl_2",[KOMI_POLICY_CHANS, KOMI_POLICY_CHANS], self.model_dtype)
-            b_kpl2 = bias_variable("b_kpl_2",[KOMI_POLICY_CHANS], self.model_dtype)
-            self.add_weights(W_kpl2)
-            self.add_weights(b_kpl2)
-            h_kpl2 = tf.nn.relu(tf.add(tf.matmul(h_kpl1, W_kpl2), b_kpl2))
-
-            h_conv_pol_flat = tf.concat([h_conv_pol_flat, h_kpl2], 1)
-            POLICY_DENSE_INPUTS += KOMI_POLICY_CHANS
         W_fc1 = weight_variable("w_fc_1",[POLICY_DENSE_INPUTS, BOARD_SQUARES + 1], self.model_dtype)
         b_fc1 = bias_variable("b_fc_1",[BOARD_SQUARES + 1], self.model_dtype)
         self.add_weights(W_fc1)
         self.add_weights(b_fc1)
         h_fc1 = tf.add(tf.matmul(h_conv_pol_flat, W_fc1), b_fc1)
 
-        # Value head - alpha is h_fc3
+        # Value head - alpha
         conv_val = self.conv_block(flow, filter_size=1,
                                    input_channels=self.residual_filters,
                                    output_channels=VAL_OUTPUTS,
-                                   name="value_head")
-        h_conv_val_flat = tf.reshape(conv_val, [-1, VAL_OUTPUTS * BOARD_SQUARES])
+                                   name="value_conv")
+        if not USE_ONLY_GLOBAL_STATS:
+            value_initial_channels = VAL_OUTPUTS * BOARD_SQUARES
+            value_flow = tf.reshape(conv_val, [-1, value_initial_channels])
+        else:
+            value_flow = self.conv_block(conv_val, filter_size=1,
+                                       input_channels=VAL_OUTPUTS,
+                                       output_channels=VALUE_GLOBAL_STATS,
+                                       name="value_pooling_conv")
+            value_flow = tf.reduce_mean(value_flow, axis=[2,3], name="value_pooling")
+            value_initial_channels = VALUE_GLOBAL_STATS
 
-        W_fc2 = weight_variable("w_fc_2",[VAL_OUTPUTS * BOARD_SQUARES, VAL_CHANS], self.model_dtype)
-        b_fc2 = bias_variable("b_fc_2",[VAL_CHANS], self.model_dtype)
-        self.add_weights(W_fc2)
-        self.add_weights(b_fc2)
-        h_fc2 = tf.nn.relu(tf.add(tf.matmul(h_conv_val_flat, W_fc2), b_fc2))
+
+        # Value blocks (optional)
+        for i in range(0, VALUE_BLOCKS):
+            if i==0 and value_initial_channels != VALUE_CHANNELS:
+                block_name = "value_dense_" + str(i)
+                value_flow = self.dense_block(value_flow,
+                                              input_channels=value_initial_channels,
+                                              output_channels=VALUE_CHANNELS,
+                                              batch_norm=True,
+                                              name=block_name)
+            else:
+                block_name = "value_resdense_" + str(i)
+                value_flow = self.resdense_block(value_flow, channels=VALUE_CHANNELS,
+                                                name=block_name)
+
+        block_inputs = VALUE_CHANNELS if VALUE_BLOCKS > 0 else value_initial_channels
+        h_fc2 = self.dense_block(value_flow,
+                                 input_channels=block_inputs,
+                                 output_channels=VAL_CHANS,
+                                 name="fc_2")
+        # W_fc2 = weight_variable("w_fc_2",[VAL_OUTPUTS * BOARD_SQUARES, VAL_CHANS], self.model_dtype)
+        # b_fc2 = bias_variable("b_fc_2",[VAL_CHANS], self.model_dtype)
+        # self.add_weights(W_fc2)
+        # self.add_weights(b_fc2)
+        # h_fc2 = tf.nn.relu(tf.add(tf.matmul(h_conv_val_flat, W_fc2), b_fc2))
+
 
         if VALUE_HEAD_TYPE == DOUBLE_I:
             value_head_rets = 2
         else:
             value_head_rets = 1
 
-        W_fc3 = weight_variable("w_fc_3",[VAL_CHANS, value_head_rets], self.model_dtype)
-        b_fc3 = bias_variable("b_fc_3",[value_head_rets], self.model_dtype)
-        self.add_weights(W_fc3)
-        self.add_weights(b_fc3)
-        h_fc3 = tf.add(tf.matmul(h_fc2, W_fc3), b_fc3) # alpha
+        h_fc3 = self.dense_block(h_fc2,
+                                 input_channels=VAL_CHANS,
+                                 output_channels=value_head_rets,
+                                 relu=False,
+                                 name="fc_3")
+        # W_fc3 = weight_variable("w_fc_3",[VAL_CHANS, value_head_rets], self.model_dtype)
+        # b_fc3 = bias_variable("b_fc_3",[value_head_rets], self.model_dtype)
+        # self.add_weights(W_fc3)
+        # self.add_weights(b_fc3)
+        # h_fc3 = tf.add(tf.matmul(h_fc2, W_fc3), b_fc3)
 
         scale_factor = tf.constant(10.0 / BOARD_SQUARES / self.beta_scale)
 
         if VALUE_HEAD_TYPE == SINGLE:
-            h_fc8 = None
-            h_fc7 = tf.nn.tanh(h_fc3)
+            alpha = tf.add(h_fc3, -x_komi)
+            halfbeta = 1.0
 
-            # Value head - beta is h_fc5
+        # Value head - beta is 2 * halfbeta because one computes tanh(halfbeta * (alpha + kt))
 
         else:
             if VALUE_HEAD_TYPE == DOUBLE_I:
-                h_fc5 = tf.scalar_mul(scale_factor, tf.exp(h_fc3[1])) # correct? wrong?
                 h_fc3 = h_fc3[0]                                      # correct? wrong?
+                h_fc5 = h_fc3[1]                                      # correct? wrong?
 
             elif VALUE_HEAD_TYPE == DOUBLE_T:
-                W_fc5 = weight_variable("w_fc_5",[VAL_CHANS, 1], self.model_dtype)
-                b_fc5 = bias_variable("b_fc_5",[1], self.model_dtype)
+                W_fc5 = weight_variable("w_fc_5",[VAL_CHANS, VBE_NUM], self.model_dtype)
+                b_fc5 = bias_variable("b_fc_5",[VBE_NUM], self.model_dtype)
                 self.add_weights(W_fc5)
                 self.add_weights(b_fc5)
-
-                h_fc5 = tf.scalar_mul(scale_factor, tf.exp(tf.add(tf.matmul(h_fc2, W_fc5), b_fc5)))
+                h_fc5 = tf.add(tf.matmul(h_fc2, W_fc5), b_fc5)
 
             elif VALUE_HEAD_TYPE == DOUBLE_Y:
-                W_fc4 = weight_variable("w_fc_4",[VAL_OUTPUTS * BOARD_SQUARES, VBE_CHANS], self.model_dtype)
-                b_fc4 = bias_variable("b_fc_4",[VBE_CHANS], self.model_dtype)
-                self.add_weights(W_fc4)
-                self.add_weights(b_fc4)
-                h_fc4 = tf.nn.relu(tf.add(tf.matmul(h_conv_val_flat, W_fc4), b_fc4))
+                h_fc4 = self.dense_block(value_flow,
+                                         input_channels=block_inputs,
+                                         output_channels=VBE_CHANS,
+                                         name="fc_4")
+                # W_fc4 = weight_variable("w_fc_4",[VAL_OUTPUTS * BOARD_SQUARES, VBE_CHANS], self.model_dtype)
+                # self.add_weights(W_fc4)
+                # b_fc4 = bias_variable("b_fc_4",[VBE_CHANS], self.model_dtype)
+                # self.add_weights(b_fc4)
+                # h_fc4 = tf.nn.relu(tf.add(tf.matmul(value_flow, W_fc4), b_fc4))
 
-                W_fc5 = weight_variable("w_fc_5",[VBE_CHANS, 1], self.model_dtype)
-                b_fc5 = bias_variable("b_fc_5",[1], self.model_dtype)
-                self.add_weights(W_fc5)
-                self.add_weights(b_fc5)
-
-                h_fc5 = tf.scalar_mul(scale_factor, tf.exp(tf.add(tf.matmul(h_fc4, W_fc5), b_fc5)))
+                h_fc5 = self.dense_block(h_fc4,
+                                         input_channels=VBE_CHANS,
+                                         output_channels=VBE_NUM,
+                                         relu=False,
+                                         name="fc_5")
+                # W_fc5 = weight_variable("w_fc_5",[VBE_CHANS, VBE_NUM], self.model_dtype)
+                # b_fc5 = bias_variable("b_fc_5",[VBE_NUM], self.model_dtype)
+                # self.add_weights(W_fc5)
+                # self.add_weights(b_fc5)
+                # h_fc5 = tf.add(tf.matmul(h_fc4, W_fc5), b_fc5)
 
             elif VALUE_HEAD_TYPE == DOUBLE_V:
                 conv_vbe = self.conv_block(flow, filter_size=1,
@@ -820,18 +1001,32 @@ class TFProcess:
                 self.add_weights(b_fc4)
                 h_fc4 = tf.nn.relu(tf.add(tf.matmul(h_conv_vbe_flat, W_fc4), b_fc4))
 
-                W_fc5 = weight_variable("w_fc_5",[VBE_CHANS, 1], self.model_dtype)
-                b_fc5 = bias_variable("b_fc_5",[1], self.model_dtype)
+                W_fc5 = weight_variable("w_fc_5",[VBE_CHANS, VBE_NUM], self.model_dtype)
+                b_fc5 = bias_variable("b_fc_5",[VBE_NUM], self.model_dtype)
                 self.add_weights(W_fc5)
                 self.add_weights(b_fc5)
+                h_fc5 = tf.add(tf.matmul(h_fc4, W_fc5), b_fc5)
 
-                h_fc5 = tf.scalar_mul(scale_factor, tf.exp(tf.add(tf.matmul(h_fc4, W_fc5), b_fc5)))
+            if QUARTILE_ENCODING:
+                if VBE_NUM == 1:
+                    # single sigmoid, the two heads are alpha25 and alpha75
+                    alpha = 0.5 * ( h_fc3 + h_fc5 )
+                    interq_range = h_fc5 - h_fc3
+                else:
+                    # piecewise sigmoid, alpha is alpha and the second head holds the quartiles
+                    alpha = h_fc3
+                    interq_range = (h_fc5 - h_fc3) * np.array([-1,1], ndmin=2)
 
-            h_fc6 = tf.multiply(h_fc5, tf.add(h_fc3, x_komi))    # beta x (alpha + kt)
-#            h_fc7 = tf.nn.tanh(h_fc6)                            # win-rate
-#            h_fc8 = tf.multiply(h_fc5, h_fc3)    # beta x alpha
+                eps = 0.05
+                log3 = 1.0986122886681096913952452369225
+                halfbeta = log3 / ( eps + tf.nn.relu(interq_range) )
+            else:
+                alpha = h_fc3
+                halfbeta = tf.scalar_mul(scale_factor, tf.exp(h_fc5))
 
-        return h_fc1, h_fc6, h_fc3         # policy, win-log-odds, alpha
+
+
+        return h_fc1, alpha, halfbeta         # policy-logits, alpha, beta/2
 
     def snap_save(self):
         # Save a snapshot of all the variables in the current graph.
@@ -903,7 +1098,7 @@ class TFProcessTest(unittest.TestCase):
         tfprocess.init(batch_size=1)
         # use known data to test replace_weights() works.
         data = gen_block(3, 18, tfprocess.residual_filters) # input conv
-        for _ in range(tfprocess.residual_blocks):
+        for _ in range(tfprocess.resconv_blocks):
             data.extend(gen_block(3,
                 tfprocess.residual_filters, tfprocess.residual_filters))
             data.extend(gen_block(3,

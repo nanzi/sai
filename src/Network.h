@@ -64,7 +64,7 @@ constexpr auto WINOGRAD_TILE = WINOGRAD_ALPHA * WINOGRAD_ALPHA;
 constexpr auto WINOGRAD_P = WINOGRAD_WTILES * WINOGRAD_WTILES;
 constexpr auto SQ2 = 1.4142135623730951f; // Square root of 2
 
-std::pair<float, float> sigmoid(float alpha, float beta, float bonus);
+std::pair<float, float> sigmoid(float alpha, float beta, float bonus, float beta2=-1.0f);
 
 extern std::array<std::array<int, NUM_INTERSECTIONS>, 8>
     symmetry_nn_idx_table;
@@ -92,6 +92,29 @@ class Network {
         RANDOM_SYMMETRY,
         AVERAGE
     };
+    enum WeightsSection
+    {
+        NONE,
+        INPUT_CONV,
+        RESCONV_TOWER,
+        POL_CONV_TOWER,
+        POL_DENSE,
+        VALUE_CONV,
+        VALUE_AVGPOOL,
+        VALUE_DENSE_TOWER,
+        VAL_DENSE_HIDDEN,
+        VAL_DENSE_OUT,
+        VBE_DENSE_HIDDEN,
+        VBE_DENSE_OUT
+    };
+    struct WeightsFileIndex {
+        enum WeightsSection section = NONE;
+        enum WeightsSection previous = NONE;
+        size_t line = size_t{0};
+        size_t excess = size_t{0}; // excess lines previously read
+        bool complete = false;
+    };
+
     using PolicyVertexPair = std::pair<float, int>;
     using Netresult = NNCache::Netresult;
 
@@ -139,25 +162,31 @@ class Network {
     void nncache_resize(int max_count);
     void nncache_clear();
 
-    int m_value_head_type = SINGLE;
-    bool m_value_head_sai; // was is_multi_komi_net
-    size_t m_residual_blocks = size_t{3};
-    size_t m_channels = size_t{128};
+    int m_value_head_type = 0;
+    bool m_value_head_sai = false;
+    size_t m_residual_blocks = size_t{0};
+    size_t m_channels = size_t{0};
     size_t m_input_moves = size_t{DEFAULT_INPUT_MOVES};
     size_t m_input_planes = size_t{DEFAULT_COLOR_INPUT_PLANES};
     bool m_adv_features = false;
     bool m_chainlibs_features = false;
     bool m_chainsize_features = false;
-    bool m_komi_policy = false;
+    bool m_quartile_encoding = false;
     bool m_include_color = true;
-    size_t m_policy_outputs = size_t{2};
-    size_t m_komipolicy_chans = size_t{0};
+    size_t m_policy_conv_layers = size_t{0};
+    size_t m_policy_channels = size_t{0};
+    size_t m_policy_outputs = size_t{0};
+    size_t m_value_channels = size_t{0};
+    size_t m_val_dense_inputs = size_t{0};
     size_t m_val_outputs = size_t{1};
-    size_t m_vbe_outputs = size_t{0};
-    size_t m_val_chans = size_t{256};
+    size_t m_val_pool_outputs = size_t{0};
+    size_t m_val_chans = size_t{0};
     size_t m_vbe_chans = size_t{0};
-    size_t m_value_head_rets = size_t{1};
+    size_t m_value_head_rets = size_t{0};
+    size_t m_val_head_rets = size_t{0};
+    size_t m_vbe_head_rets = size_t{0};
 
+    
     // 'Drain' evaluations.  Threads with an evaluation will throw a NetworkHaltException
     // if possible, or will just proceed and drain ASAP.  New evaluation requests will
     // also result in a NetworkHaltException.
@@ -167,6 +196,14 @@ class Network {
     virtual void resume_evals();
     
   private:
+    void add_zero_channels();
+    bool read_weights_line(std::istream& wtfile, std::vector<float>& weights);
+    bool read_weights_block(std::istream& wtfile, std::array<std::vector<float>, 4> &layer,
+                            WeightsFileIndex &id);
+    void identify_layer(std::array<std::vector<float>, 4> &layer, WeightsFileIndex &id);
+    void set_network_parameters(std::array<std::vector<float>, 4> &layer, WeightsFileIndex &id);
+    void print_network_details();
+    void store_layer(std::array<std::vector<float>, 4> &layer, WeightsFileIndex &id);
     int load_v1_network(std::istream &wtfile, int format_version);
     int load_network_file(const std::string &filename);
 
@@ -190,6 +227,7 @@ class Network {
     static void winograd_sgemm(const std::vector<float> &U,
                                const std::vector<float> &V,
                                std::vector<float> &M, const int C, const int K);
+    void reduce_mean(std::vector<float> &layer, size_t area);
     Netresult get_output_internal(const GameState *const state,
                                   const int symmetry, bool selfcheck = false);
     static void fill_input_plane_pair(const FullBoard &board,
@@ -208,8 +246,10 @@ class Network {
                                                const int symmetry);
 
     bool probe_cache(const GameState *const state, Network::Netresult &result);
+    float get_sai_winrate(Network::Netresult& result, const GameState* const state);
     std::unique_ptr<ForwardPipe> &&init_net(int channels,
                                             std::unique_ptr<ForwardPipe> &&pipe);
+    void dump_array(std::string name, std::vector<float> &array);
 #ifdef USE_HALF
     void select_precision(int channels);
 #endif
@@ -227,21 +267,27 @@ class Network {
     std::shared_ptr<ForwardPipeWeights> m_fwd_weights;
 
     // Policy head
-    std::vector<float> m_bn_pol_w1; // policy_outputs
-    std::vector<float> m_bn_pol_w2; // policy_outputs
+    // std::vector<float> m_bn_pol_w1; // policy_outputs
+    // std::vector<float> m_bn_pol_w2; // policy_outputs
 
-    std::vector<float> m_kp1_pol_w; // (board_sq*policy_outputs+1)*komipolicy_chans
-    std::vector<float> m_kp1_pol_b; // komipolicy_chans
+    //    std::vector<float> m_kp1_pol_w; // (board_sq*policy_outputs+1)*komipolicy_chans
+    //    std::vector<float> m_kp1_pol_b; // komipolicy_chans
 
-    std::vector<float> m_kp2_pol_w; // komipolicy_chans*komipolicy_chans
-    std::vector<float> m_kp2_pol_b; // board_sq*policy_outputs*(board_sq+1)
+    //    std::vector<float> m_kp2_pol_w; // komipolicy_chans*komipolicy_chans
+    //    std::vector<float> m_kp2_pol_b; // board_sq*policy_outputs*(board_sq+1)
 
     std::vector<float> m_ip_pol_w;  // (board_sq*policy_outputs + komipolicy_chans)*(board_sq+1)
     std::vector<float> m_ip_pol_b;  // board_sq+1
 
     // Value head alpha (val=Value ALpha)
-    std::vector<float> m_bn_val_w1; // val_outputs
-    std::vector<float> m_bn_val_w2; // val_outputs
+    // std::vector<float> m_bn_val_w1; // val_outputs
+    // std::vector<float> m_bn_val_w2; // val_outputs
+
+    std::vector<std::vector<float>> m_vh_dense_weights;
+    std::vector<std::vector<float>> m_vh_dense_biases1;
+    std::vector<std::vector<float>> m_vh_dense_biases;
+    std::vector<std::vector<float>> m_vh_dense_bn_means;
+    std::vector<std::vector<float>> m_vh_dense_bn_vars;
 
     std::vector<float> m_ip1_val_w; // board_sq*val_outputs*val_chans
     std::vector<float> m_ip1_val_b; // val_chans
@@ -252,8 +298,8 @@ class Network {
     bool m_value_head_not_stm;
 
     // Value head beta (vbe=Value BEta)
-    std::vector<float> m_bn_vbe_w1; // vbe_outputs
-    std::vector<float> m_bn_vbe_w2; // vbe_outputs
+    // std::vector<float> m_bn_vbe_w1; // vbe_outputs
+    // std::vector<float> m_bn_vbe_w2; // vbe_outputs
 
     std::vector<float> m_ip1_vbe_w; // board_sq*vbe_outputs*vbe_chans
     std::vector<float> m_ip1_vbe_b; // vbe_chans

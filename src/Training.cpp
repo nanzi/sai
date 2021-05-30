@@ -195,10 +195,7 @@ void Training::record(Network & network, GameState& state, UCTNode& root) {
                            Network::IDENTITY_SYMMETRY,
                            cfg_use_nncache,
                            cfg_use_nncache);
-    step.net_winrate =
-        sigmoid(result.alpha, result.beta,
-                state.board.black_to_move() ? -komi : komi).first;
-    //    step.net_winrate = result.winrate;
+    step.net_winrate = result.value;
 
     const auto& best_node = root.get_best_root_child(step.to_move);
     step.root_uct_winrate = root.get_eval(step.to_move);

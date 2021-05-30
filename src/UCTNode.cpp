@@ -68,6 +68,7 @@ bool UCTNode::create_children(Network & network,
                               float& value,
                               float& alpkt,
                               float& beta,
+                              float& beta2,
                               float min_psa_ratio) {
 
     // no successors in final state
@@ -106,11 +107,13 @@ bool UCTNode::create_children(Network & network,
     if (network.m_value_head_sai) {
         m_net_alpkt = alpkt = state.get_alpkt(raw_netlist.alpha);
         m_net_beta = beta = raw_netlist.beta;
+        m_net_beta2 = beta2 = raw_netlist.beta2;
         m_net_pi = value;
     } else {
         const auto alpha = raw_netlist.alpha; // logits of winrate
         m_net_alpkt = alpkt = (to_move == FastBoard::BLACK) ? alpha : -alpha;
         m_net_beta = beta = 1.0f;
+        m_net_beta2 = beta2 = 1.0f;
         m_net_pi = value;
     }
 
@@ -200,12 +203,12 @@ bool UCTNode::create_children(Network & network,
 
     link_nodelist(nodecount, nodelist, min_psa_ratio);
     // Increment visit and assign eval.
-    const auto result = SearchResult::from_eval(value, alpkt, beta,
+    const auto result = SearchResult::from_eval(value, alpkt, beta, beta2,
                                                 network.m_value_head_sai);
     update(result);
     if (network.m_value_head_sai) {
         set_lambda_mu(state);
-        update_all_quantiles(alpkt, beta);
+        update_all_quantiles(alpkt, beta, beta2);
     }
     expand_done();
     return true;
@@ -291,10 +294,11 @@ float UCTNode::update(const SearchResult &result, bool forced) {
 
 void UCTNode::update_gxx_sums(std::atomic<float> &old_gxgp_sum,
                               std::atomic<float> &old_gp_sum,
-                              float old_quantile,
-                              float new_alpkt, float new_beta) {
-    const auto g_func = sigmoid(new_alpkt, new_beta, old_quantile);
-    const auto gp_term = new_beta * g_func.first * g_func.second;
+                              float old_quantile, float new_alpkt,
+                              float new_beta, float new_beta2) {
+    const auto g_func = sigmoid(new_alpkt, new_beta, old_quantile, new_beta2);
+    const auto right_beta = (new_beta2 > 0 && new_alpkt + old_quantile > 0) ? new_beta2 : new_beta;
+    const auto gp_term = right_beta * g_func.first * g_func.second;
     const auto gxgp_term = g_func.first - old_quantile * gp_term;
     atomic_add(old_gxgp_sum, gxgp_term);
     atomic_add(old_gp_sum, gp_term);
@@ -303,7 +307,7 @@ void UCTNode::update_gxx_sums(std::atomic<float> &old_gxgp_sum,
 void UCTNode::update_quantile(std::atomic<float> &old_quantile,
                               float old_gxgp_sum, float old_gp_sum,
                               float parameter, int new_visits, float avg_pi,
-                              float new_alpkt, float new_beta) {
+                              float new_alpkt, float new_beta, float new_beta2) {
     if (std::abs(parameter) < 1e-5) {
         old_quantile = 0.0f;
         return;
@@ -315,7 +319,8 @@ void UCTNode::update_quantile(std::atomic<float> &old_quantile,
     // flexible and set the first value also in those cases.
     if (new_visits <= 8 && old_quantile == 0.0f) {
         // No numerical issues here, as avg_p is away from 0 and 1
-        old_quantile = (std::log(avg_p) - std::log1p(-avg_p)) / std::max(0.01f, new_beta) - new_alpkt;
+        const auto right_beta = (new_beta2 > 0 && avg_p > 0.5) ? new_beta2 : new_beta;
+        old_quantile = (std::log(avg_p) - std::log1p(-avg_p)) / std::max(0.01f, right_beta) - new_alpkt;
     } else {
         const auto avg_f_prime = old_gp_sum / float(new_visits);
         const auto avg_f = old_gxgp_sum / float(new_visits)
@@ -325,7 +330,7 @@ void UCTNode::update_quantile(std::atomic<float> &old_quantile,
     }
 }
 
-void UCTNode::update_all_quantiles(float new_alpkt, float new_beta) {
+void UCTNode::update_all_quantiles(float new_alpkt, float new_beta, float new_beta2) {
     // Cache values to avoid race conditions.
     const auto avg_pi = get_avg_pi();
     const auto old_q_lambda = static_cast<float>(m_quantile_lambda);
@@ -333,23 +338,23 @@ void UCTNode::update_all_quantiles(float new_alpkt, float new_beta) {
     const auto old_q_one = static_cast<float>(m_quantile_one);
     const auto new_visits = static_cast<int>(++m_quantile_updates);
     update_gxx_sums(m_gxgp_sum_lambda, m_gp_sum_lambda, old_q_lambda,
-                    new_alpkt, new_beta);
+                    new_alpkt, new_beta, new_beta2);
     update_gxx_sums(m_gxgp_sum_mu, m_gp_sum_mu, old_q_mu,
-                    new_alpkt, new_beta);
+                    new_alpkt, new_beta, new_beta2);
     update_gxx_sums(m_gxgp_sum_one, m_gp_sum_one, old_q_one,
-                    new_alpkt, new_beta);
+                    new_alpkt, new_beta, new_beta2);
     update_quantile(m_quantile_lambda,
                     static_cast<float>(m_gxgp_sum_lambda),
                     static_cast<float>(m_gp_sum_lambda),
-                    get_lambda(), new_visits, avg_pi, new_alpkt, new_beta);
+                    get_lambda(), new_visits, avg_pi, new_alpkt, new_beta, new_beta2);
     update_quantile(m_quantile_mu,
                     static_cast<float>(m_gxgp_sum_mu),
                     static_cast<float>(m_gp_sum_mu),
-                    get_mu(), new_visits, avg_pi, new_alpkt, new_beta);
+                    get_mu(), new_visits, avg_pi, new_alpkt, new_beta, new_beta2);
     update_quantile(m_quantile_one,
                     static_cast<float>(m_gxgp_sum_one),
                     static_cast<float>(m_gp_sum_one),
-                    1, new_visits, avg_pi, new_alpkt, new_beta);
+                    1, new_visits, avg_pi, new_alpkt, new_beta, new_beta2);
 }
 
 bool UCTNode::has_children() const {
@@ -371,10 +376,11 @@ float UCTNode::get_policy() const {
     return m_policy;
 }
 
-void UCTNode::set_values(float value, float alpkt, float beta) {
+void UCTNode::set_values(float value, float alpkt, float beta, float beta2) {
     m_net_pi = value;
     m_net_alpkt = alpkt;
     m_net_beta = beta;
+    m_net_beta2 = beta2;
 }
 
 void UCTNode::set_policy(float policy) {
@@ -658,7 +664,7 @@ UCTNode* UCTNode::uct_select_child(const GameState & currstate,
 #ifndef NDEBUG
             b_psa = psa;
             b_q = winrate;
-            b_denom = denom;
+            b_denom = get_denom();
 #endif
         }
     }
@@ -666,7 +672,7 @@ UCTNode* UCTNode::uct_select_child(const GameState & currstate,
     assert(best != nullptr);
     if(best->get_visits() == 0) {
         best->inflate();
-        best->get()->set_values(m_net_pi, m_net_alpkt, m_net_beta);
+        best->get()->set_values(m_net_pi, m_net_alpkt, m_net_beta, m_net_beta2);
     }
 #ifndef NDEBUG
     best->get()->set_urgency(best_value, b_psa, b_q,

@@ -113,9 +113,12 @@ R"(
     }
 
 __kernel void merge(
+                        __global const net_t * restrict means,
+                        __global const net_t * restrict stdevs,
                         __global const net_t * restrict in,
                         __global net_t * restrict out,
-                        __private const int channels) {
+                        __private const int channels,
+                        __private const int add_origin) {
         // cl::NDRange global(outputs, NUM_INTERSECTIONS);
         const int gx = get_global_id(0);
         const int gy = get_global_id(1);
@@ -131,6 +134,13 @@ __kernel void merge(
             sum += vload_net_t(batch * channels * NUM_INTERSECTIONS * outputs +
                 (c * NUM_INTERSECTIONS + b) * outputs + o, in);
         }
+        real mean = vload_net_t(o, means);
+        real stdev = vload_net_t(o, stdevs);
+        sum = (sum - mean) * stdev;       // Batch normalization
+        if (add_origin) {
+            sum += vload_net_t(batch * outputs * NUM_INTERSECTIONS + o * NUM_INTERSECTIONS + b, out);
+        }
+        sum = sum > ZERO ? sum : ZERO;    // ReLU
         vstore_net_t(sum, batch * outputs * NUM_INTERSECTIONS + o * NUM_INTERSECTIONS + b, out);
     }
 

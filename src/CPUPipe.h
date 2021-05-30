@@ -42,8 +42,7 @@ public:
     virtual void initialize(const int channels);
     virtual void forward(const std::vector<float>& input,
                          std::vector<float>& output_pol,
-                         std::vector<float>& output_val,
-                         std::vector<float>& output_vbe);
+                         std::vector<float>& output_val);
 
     virtual void push_weights(unsigned int filter_size,
                               unsigned int channels,
@@ -75,12 +74,5 @@ private:
 
     // Input + residual block tower
     std::shared_ptr<const ForwardPipeWeights> m_weights;
-
-    std::vector<float> m_conv_pol_w;
-    std::vector<float> m_conv_val_w;
-    std::vector<float> m_conv_vbe_w;
-    std::vector<float> m_conv_pol_b;
-    std::vector<float> m_conv_val_b;
-    std::vector<float> m_conv_vbe_b;
 };
 #endif

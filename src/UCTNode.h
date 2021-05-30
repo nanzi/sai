@@ -68,7 +68,7 @@ public:
     bool create_children(Network & network,
                          std::atomic<int>& nodecount,
                          GameState& state, float& value, float& alpkt,
-                                     float& beta,
+                         float& beta, float& beta2,
                          float min_psa_ratio = 0.0f);
 
     const std::vector<UCTNodePointer>& get_children() const;
@@ -98,7 +98,7 @@ public:
     float get_eval(int tomove = FastBoard::BLACK) const;
     float get_raw_eval(int tomove, int virtual_loss = 0) const;
     float get_net_pi(int tomove = FastBoard::BLACK) const;
-    void set_values(float value, float alpkt, float beta);
+    void set_values(float value, float alpkt, float beta, float beta2);
     bool low_visits_child(UCTNode* const child) const;
 #ifdef USE_EVALCMD
     void set_progid(int id);
@@ -139,14 +139,15 @@ public:
     UCTStats get_uct_stats() const;
     void update_quantile(std::atomic<float> &old_quantile, float old_gxgp_sum,
                          float old_gp_sum, float parameter, int new_visits,
-                         float avg_pi, float new_alpkt, float new_beta);
-    void update_all_quantiles(float new_alpkt, float new_beta);
+                         float avg_pi, float new_alpkt, float new_beta, float new_beta2);
+    void update_all_quantiles(float new_alpkt, float new_beta, float new_beta2);
     std::tuple<float, float, float> score_stats() const;
     void clear_expand_state();
 
     float get_avg_pi(int tomove = FastBoard::BLACK) const;
     float get_net_alpkt() const { return m_net_alpkt; }
     float get_net_beta() const { return m_net_beta; }
+    float get_net_beta2() const { return m_net_beta2; }
     float get_lambda() const { return m_lambda; }
     float get_mu() const { return m_mu; }
     float get_quantile_lambda(int tomove = FastBoard::BLACK) const;
@@ -188,8 +189,8 @@ private:
     void az_sum_recursion(float& sum, size_t& n) const;
     void update_gxx_sums(std::atomic<float> &old_gxgp_sum,
                          std::atomic<float> &old_gp_sum,
-                         float old_quantile,
-                         float new_alpkt, float new_beta);
+                         float old_quantile, float new_alpkt,
+                         float new_beta, float new_beta2);
 
     // Note : This class is very size-sensitive as we are going to create
     // tens of millions of instances of these.  Please put extra caution
@@ -264,6 +265,7 @@ private:
 
     float m_net_alpkt{0.0f}; // alpha + \tilde k
     float m_net_beta{1.0f};
+    float m_net_beta2{-1.0f};
     float m_lambda{0.0f};
     float m_mu{0.0f};
 

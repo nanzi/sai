@@ -281,11 +281,11 @@ void UCTNode::prepare_root_node(Network & network, int color,
                                 GameState& root_state,
                                 bool fast_roll_out,
                                 bool verbose) {
-    float root_value, root_alpkt, root_beta;
+    float root_value, root_alpkt, root_beta, root_beta2;
 
     const auto had_children = has_children();
     if (expandable()) {
-        create_children(network, nodes, root_state, root_value, root_alpkt, root_beta);
+        create_children(network, nodes, root_state, root_value, root_alpkt, root_beta, root_beta2);
     }
     if (has_children() && !had_children) {
         // blackevals is useless here because root nodes are never

@@ -46,6 +46,7 @@
 #include "CPUPipe.h"
 #include "Network.h"
 #include "Im2Col.h"
+#include "Utils.h"
 
 #ifndef USE_BLAS
 // Eigen helpers
@@ -406,8 +407,7 @@ void batchnorm(const size_t channels,
 
 void CPUPipe::forward(const std::vector<float> &input,
                       std::vector<float> &output_pol,
-                      std::vector<float> &output_val,
-                      std::vector<float> &output_vbe)
+                      std::vector<float> &output_val)
 {
     // Input convolution
     constexpr auto P = WINOGRAD_P;
@@ -450,26 +450,64 @@ void CPUPipe::forward(const std::vector<float> &input,
                                      m_weights->m_batchnorm_stddevs[i + 1].data(),
                                      res.data());
     }
-    convolve<1>(m_conv_pol_b.size(), conv_out, m_conv_pol_w, m_conv_pol_b, output_pol);
-    convolve<1>(m_conv_val_b.size(), conv_out, m_conv_val_w, m_conv_val_b, output_val);
-    if (m_conv_vbe_b.size() > 0)
+    output_pol = conv_out;
+    for (auto i = size_t{0}; i < m_weights->m_conv_pol_w.size(); i++)
     {
-        convolve<1>(m_conv_vbe_b.size(), conv_out, m_conv_vbe_w, m_conv_vbe_b, output_vbe);
+        std::swap(output_pol, conv_in);
+        auto input_channels = conv_in.size() / NUM_INTERSECTIONS;
+        auto output_channels = m_weights->m_conv_pol_b[i].size();
+        output_pol.resize(output_channels * NUM_INTERSECTIONS);
+        convolve<1>(output_channels, conv_in,
+                    m_weights->m_conv_pol_w[i], m_weights->m_conv_pol_b[i], output_pol);
+        batchnorm<NUM_INTERSECTIONS>(output_channels, output_pol,
+                                     m_weights->m_bn_pol_w1[i].data(),
+                                     m_weights->m_bn_pol_w2[i].data());
+        if (input_channels != output_channels || i+1 == m_weights->m_conv_pol_w.size() || !RESCONV_IN_POLICY_HEAD) {
+            // Not a residual layer
+            continue;
+        }
+
+        ++i;
+        std::swap(conv_in, res);
+        std::swap(output_pol, conv_in);
+        output_channels = m_weights->m_conv_pol_b[i].size();
+        output_pol.resize(output_channels * NUM_INTERSECTIONS);
+        convolve<1>(output_channels, conv_in,
+                    m_weights->m_conv_pol_w[i], m_weights->m_conv_pol_b[i], output_pol);
+        batchnorm<NUM_INTERSECTIONS>(output_channels, output_pol,
+                                     m_weights->m_bn_pol_w1[i].data(),
+                                     m_weights->m_bn_pol_w2[i].data(),
+                                     res.data());
+    }
+
+    if (0 == m_weights->m_conv_val_pool_b.size()) {
+        convolve<1>(m_weights->m_conv_val_b.size(), conv_out,
+                    m_weights->m_conv_val_w, m_weights->m_conv_val_b,
+                    output_val);
+        batchnorm<NUM_INTERSECTIONS>(m_weights->m_conv_val_b.size(), output_val,
+                                     m_weights->m_bn_val_w1.data(),
+                                     m_weights->m_bn_val_w2.data());
+    } else {
+        auto conv_val_out = std::vector<float>(m_weights->m_conv_val_b.size() * NUM_INTERSECTIONS);
+        convolve<1>(m_weights->m_conv_val_b.size(), conv_out,
+                    m_weights->m_conv_val_w, m_weights->m_conv_val_b,
+                    conv_val_out);
+        batchnorm<NUM_INTERSECTIONS>(m_weights->m_conv_val_b.size(), conv_val_out,
+                                     m_weights->m_bn_val_w1.data(),
+                                     m_weights->m_bn_val_w2.data());
+        convolve<1>(m_weights->m_conv_val_pool_b.size(), conv_val_out,
+                    m_weights->m_conv_val_pool_w, m_weights->m_conv_val_pool_b,
+                    output_val);
+        batchnorm<NUM_INTERSECTIONS>(m_weights->m_conv_val_pool_b.size(), output_val,
+                                     m_weights->m_bn_val_pool_w1.data(),
+                                     m_weights->m_bn_val_pool_w2.data());
     }
 }
 
 void CPUPipe::push_weights(unsigned int /*filter_size*/,
                            unsigned int /*channels*/,
-                           unsigned int outputs,
+                           unsigned int /*outputs*/,
                            std::shared_ptr<const ForwardPipeWeights> weights)
 {
     m_weights = weights;
-
-    // Output head convolutions
-    m_conv_pol_w = weights->m_conv_pol_w;
-    m_conv_pol_b.resize(m_conv_pol_w.size() / outputs, 0.0f);
-    m_conv_val_w = weights->m_conv_val_w;
-    m_conv_val_b.resize(m_conv_val_w.size() / outputs, 0.0f);
-    m_conv_vbe_w = weights->m_conv_vbe_w;
-    m_conv_vbe_b.resize(m_conv_vbe_w.size() / outputs, 0.0f);
 }

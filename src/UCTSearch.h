@@ -56,24 +56,26 @@ public:
     float eval() const { return m_value;  }
     float get_alpkt() const { return m_alpkt; }
     float get_beta() const { return m_beta; }
+    float get_beta2() const { return m_beta; }
     float eval_with_bonus(float bonus, float base) const;
     bool is_forced() const { return m_forced; }
     void set_forced() { m_forced = true; }
-    static SearchResult from_eval(float value, float alpkt, float beta, bool sai_head = true) {
-        return SearchResult(value, alpkt, beta, sai_head);
+    static SearchResult from_eval(float value, float alpkt, float beta, float beta2, bool sai_head = true) {
+        return SearchResult(value, alpkt, beta, beta2, sai_head);
     }
     static SearchResult from_node(const UCTNode* node, bool sai_head = true);
     static SearchResult from_score(float board_score, bool sai_head = true) {
-        return SearchResult(Utils::winner(board_score), board_score, 10.0f, sai_head);
+        return SearchResult(Utils::winner(board_score), board_score, 10.0f, 10.0f, sai_head);
     }
 private:
-    explicit SearchResult(float value, float alpkt, float beta, bool sai_head = true)
+    explicit SearchResult(float value, float alpkt, float beta, float beta2, bool sai_head = true)
         : m_valid(true), m_value(value), m_alpkt(alpkt),
-          m_beta(beta), m_value_head_sai(sai_head) {}
+          m_beta(beta), m_beta2(beta2), m_value_head_sai(sai_head) {}
     bool m_valid{false};
     float m_value{0.5f};
     float m_alpkt{0.0f};
     float m_beta{1.0f};
+    float m_beta2{-1.0f};
     bool m_value_head_sai{true};
     bool m_forced{false};
 };

@@ -47,15 +47,21 @@ public:
         std::vector<std::vector<float>> m_batchnorm_stddevs;
 
         // Policy head
-        std::vector<float> m_conv_pol_w;    // channels*policy_outputs
-        std::vector<float> m_conv_pol_b;    // policy_outputs
+        std::vector<std::vector<float>> m_conv_pol_w;    // channels*policy_outputs
+        std::vector<std::vector<float>> m_conv_pol_b;    // policy_outputs
+        std::vector<std::vector<float>> m_bn_pol_w1;     // policy_outputs
+        std::vector<std::vector<float>> m_bn_pol_w2;     // policy_outputs
 
         // Value head
         std::vector<float> m_conv_val_w;    // channels*val_outputs
         std::vector<float> m_conv_val_b;    // val_outputs
+        std::vector<float> m_bn_val_w1;
+        std::vector<float> m_bn_val_w2;
 
-        std::vector<float> m_conv_vbe_w;    // channels*vbe_outputs
-        std::vector<float> m_conv_vbe_b;    // vbe_outputs
+        std::vector<float> m_conv_val_pool_w;    // channels*val_outputs
+        std::vector<float> m_conv_val_pool_b;    // val_outputs
+        std::vector<float> m_bn_val_pool_w1;
+        std::vector<float> m_bn_val_pool_w2;
     };
 
     virtual ~ForwardPipe() = default;
@@ -64,8 +70,7 @@ public:
     virtual bool needs_autodetect() { return false; };
     virtual void forward(const std::vector<float>& input,
                          std::vector<float>& output_pol,
-                         std::vector<float>& output_val,
-                         std::vector<float>& output_vbe) = 0;
+                         std::vector<float>& output_val) = 0;
     virtual void push_weights(unsigned int filter_size,
                               unsigned int channels,
                               unsigned int outputs,

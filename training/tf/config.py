@@ -25,7 +25,7 @@ BOARD_SIZE = 19
 BOARD_SQUARES = BOARD_SIZE * BOARD_SIZE
 
 # Workers
-WORKERS = 8
+WORKERS = 12
 
 # Sane values are from 4096 to 64 or so.
 # You need to adjust the learning rate if you change this. Should be
@@ -35,10 +35,10 @@ BATCH_SIZE = 512
 # Number of examples in a GPU batch. Higher values are more efficient.
 # The maximum depends on the amount of RAM in your GPU and the network size.
 # Must be smaller than BATCH_SIZE.
-RAM_BATCH_SIZE = 64
+RAM_BATCH_SIZE = 128
 
 # Memory allocation
-GPU_MEM_FRACTION = 0.999
+GPU_MEM_FRACTION = 0.9
 
 # 20 bit should be about 2.2GB of RAM on 19x19 and 0.5GB on 9x9
 # Formula is M*S*(16/8+4) with M the shuffle buffer size, S the board
@@ -51,8 +51,8 @@ GPU_MEM_FRACTION = 0.999
 # In the case of "moving window" training set it is also reasonable to
 # reduce more and up to a factor equal to the number of times each chunk
 # enters a training.
-TRAIN_SHUFFLE_BITS=16
-TEST_SHUFFLE_BITS=12
+TRAIN_SHUFFLE_BITS = 16
+TEST_SHUFFLE_BITS = 12
 # Use a random sample input data read. This helps improve the spread of
 # games in the shuffle buffer.
 # This should be between 2 and 4 times the ratio of N to M.
@@ -62,6 +62,9 @@ DOWN_SAMPLE = 16
 
 RESIDUAL_FILTERS = 256
 RESIDUAL_BLOCKS = 20
+RESIDUAL_BN_SCALE = True
+POLICY_BLOCKS = 0 # 0 for vanilla
+POLICY_CHANNELS = 0
 POLICY_OUTPUTS = 2
 INPUT_STM = 0 # 1: both side to move and komi in input (18 input planes)
               # 0: only komi in input (17 input planes)
@@ -71,31 +74,36 @@ WEIGHTS_FILE_VER = "209"  # 'advanced features' + 'komi policy'
                          # bit 5,  32: komi policy
                          # bit 6,  64: chain liberties features (+4 planes)
                          # bit 7, 128: chain size features (+4 planes)
-KOMI_POLICY_CHANS = 14 # only used for komi policy net format
+                         # bit 8, 256: quartile encoding (alpha_25 and alpha_75 instead of (alpha and beta)
+QUARTILE_ENCODING = False
 
 # Network structure -- Sai value head
 # Value head type can be:
 SINGLE = 1 # (Leela Zero)
-DOUBLE_V = 2
+# DOUBLE_V = 2 Not supported anymore
 DOUBLE_Y = 3
 DOUBLE_T = 4 # last two types are equivalent, changing
 DOUBLE_I = 5 # only the order of weights in the file
 
 VALUE_HEAD_TYPE = DOUBLE_Y
 VAL_OUTPUTS = 5
-VBE_OUTPUTS = 1 # only for double W
+USE_ONLY_GLOBAL_STATS = False
+VALUE_GLOBAL_STATS = 0
+VALUE_BLOCKS = 0 # 0 for vanilla
+VALUE_CHANNELS = 0
 VAL_CHANS = 384
-VBE_CHANS = 256 # only for double W and Y
+VBE_CHANS = 256 # only for double V and Y
+VBE_NUM = 1
 
 # Loss weights
 POLICY_LOSS_WT = 1.0
-MSE_LOSS_WT    = 1.0
+MSE_LOSS_WT    = 0.7
 KLE_LOSS_WT    = 0.0
 AXB_LOSS_WT    = 0.0
-REG_LOSS_WT    = 1.0
+REG_LOSS_WT    = 0.1
 
 # Policy layer calibration
-PLC_COEFF      = 0.0 # 2.0 is enough
+PLC_COEFF      = 0.0 # 2.0 is enough for the calibration to work
 
 # Learning rate
 LEARN_RATE = 0.001
@@ -106,12 +114,17 @@ TRAINING_STEPS = 1000
 # Display intermediate output after the specified number of training steps
 INFO_STEPS = 100
 
+# Together with validation losses, computes the same also on the
+# training set. This is not the same as training losses, as batch
+# normalization is computed with training=False
+USE_TRAINSET_TEST = False
+
 # Maximum number of training steps (0 continue forever)
 MAX_TRAINING_STEPS = 8000
 FIRST_NETWORK_STEPS = 4000
 
 # Maximum number of networks of which to keep meta files
-MAX_SAVER_TO_KEEP = 12
+MAX_SAVER_TO_KEEP = 5
 
 # Beta value amplification coefficient
 # (bugfix with backward compatibility concerns)

@@ -141,6 +141,8 @@ def main():
         help="Coefficient for regularizing term in loss function (default: %(default)f)")
     parser.add_argument("--betascale", default=BETA_SCALE_FACTOR, type=float,
         help="Coefficient for beta value amplification (default: %(default)f)")
+    parser.add_argument("--plc", default=PLC_COEFF, type=float,
+        help="Coefficient for policy layer calibration (default: %(default)f)")
     args = parser.parse_args()
 
     blocks = args.blocks or args.blockspref
@@ -182,7 +184,7 @@ def main():
     maxsteps = args.maxsteps * 128 // RAM_BATCH_SIZE
     tfprocess = TFProcess(blocks, filters,
                           args.rate, minsteps, steps, maxsteps, args.maxkeep,
-                          args.policyloss, args.mseloss, args.kleloss, args.axbloss, args.regloss, args.betascale)
+                          args.policyloss, args.mseloss, args.kleloss, args.axbloss, args.regloss, args.betascale, args.plc)
     tfprocess.init(RAM_BATCH_SIZE,
                    logbase=args.logbase,
                    macrobatch=BATCH_SIZE // RAM_BATCH_SIZE)

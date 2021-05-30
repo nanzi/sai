@@ -65,7 +65,11 @@ public:
 
         bool is_sai;
 
-        Netresult() : policy_pass(0.0f), value(0.0f), alpha(0.0f), beta(0.0f), is_sai(false) {
+        // more general sigmoid may have two beta values
+        float beta2;
+
+        Netresult() : policy_pass(0.0f), value(0.0f), alpha(0.0f), beta(0.0f), is_sai(false),
+                      beta2(-1.0f) {
             policy.fill(0.0f);
         }
     };

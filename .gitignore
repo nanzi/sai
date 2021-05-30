@@ -13,6 +13,7 @@ sai_opencl_tuning
 /build-validation-*
 .vs/
 build/
+debug/
 
 *~
 train_*

@@ -58,12 +58,11 @@ class OpenCLScheduler : public ForwardPipe {
         const std::vector<float>& in;
         std::vector<float>& out_p;
         std::vector<float>& out_va;
-        std::vector<float>& out_vb;
+        //        std::vector<float>& out_vb;
         ForwardQueueEntry(const std::vector<float>& input,
                           std::vector<float>& output_pol,
-                          std::vector<float>& output_val,
-                          std::vector<float>& output_vbe)
-        : in(input), out_p(output_pol), out_va(output_val), out_vb(output_vbe)
+                          std::vector<float>& output_val)
+        : in(input), out_p(output_pol), out_va(output_val)
           {}
     };
 public:
@@ -73,8 +72,7 @@ public:
     virtual void initialize(const int channels);
     virtual void forward(const std::vector<float>& input,
                          std::vector<float>& output_pol,
-                         std::vector<float>& output_val,
-                         std::vector<float>& output_vbe);
+                         std::vector<float>& output_val);
     virtual bool needs_autodetect();
     virtual void push_weights(unsigned int filter_size,
                               unsigned int channels,
@@ -119,7 +117,10 @@ private:
     void push_convolve(unsigned int filter_size,
                        unsigned int channels,
                        unsigned int outputs,
-                       const std::vector<float>& weights);
+                       const std::vector<float>& weights,
+                       const std::vector<float>& means,
+                       const std::vector<float>& variances,
+                       enum Layer::LayerType type);
 
     virtual void drain();
     virtual void resume();

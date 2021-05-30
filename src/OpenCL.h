@@ -45,20 +45,29 @@
 #include <cassert>
 #include <tuple>
 
+#include "Utils.h"
 #include "Tuner.h"
 
 template <typename net_t> class OpenCL;
 template <typename net_t> class OpenCL_Network;
 
 class Layer {
+ public:
+    enum LayerType
+    {
+        NONE,
+        INPUT_CONV,
+        RESCONV_BLOCK,
+        POL_CONV,
+        VALUE_CONV,
+        VALUE_AVGPOOL
+    };
     template <typename> friend class OpenCL_Network;
 private:
     unsigned int channels{0};
     unsigned int outputs{0};
     unsigned int filter_size{0};
-    bool is_input_convolution{false};
-    bool is_residual_block{false};
-    bool is_convolve1{false};
+    enum LayerType type = NONE;
     std::vector<cl::Buffer> weights;
 };
 
@@ -80,7 +89,6 @@ private:
     cl::Buffer m_MBuffer;
     cl::Buffer m_pinnedOutBuffer_pol;
     cl::Buffer m_pinnedOutBuffer_val;
-    cl::Buffer m_pinnedOutBuffer_vbe;
     bool m_buffers_allocated{false};
 };
 
@@ -102,7 +110,7 @@ public:
         push_weights(layer, weights);
         push_weights(layer, means);
         push_weights(layer, variances);
-        m_layers[layer].is_input_convolution = true;
+        m_layers[layer].type = Layer::INPUT_CONV;
         m_layers[layer].outputs = outputs;
         m_layers[layer].filter_size = filter_size;
         m_layers[layer].channels = channels;
@@ -124,7 +132,7 @@ public:
         push_weights(layer, weights_2);
         push_weights(layer, means_2);
         push_weights(layer, variances_2);
-        m_layers[layer].is_residual_block = true;
+        m_layers[layer].type = Layer::RESCONV_BLOCK;
         m_layers[layer].outputs = outputs;
         m_layers[layer].filter_size = filter_size;
         m_layers[layer].channels = channels;
@@ -133,13 +141,18 @@ public:
     void push_convolve(unsigned int filter_size,
                        unsigned int channels,
                        unsigned int outputs,
-                       const std::vector<net_t>& weights) {
+                       const std::vector<net_t>& weights,
+                       const std::vector<net_t>& means,
+                       const std::vector<net_t>& variances,
+                       enum Layer::LayerType type) {
         (void)filter_size;
         assert(filter_size == 1);
 
         size_t layer = get_layer_count();
         push_weights(layer, weights);
-        m_layers[layer].is_convolve1 = true;
+        push_weights(layer, means);
+        push_weights(layer, variances);
+        m_layers[layer].type = type;
         m_layers[layer].outputs = outputs;
         m_layers[layer].channels = channels;
     }
@@ -151,26 +164,28 @@ public:
     void forward(const std::vector<float>& input,
             std::vector<float>& output_pol,
             std::vector<float>& output_val,
-            std::vector<float>& output_vbe,
             OpenCLContext & opencl_context,
             const int batch_size = 1);
 
-    std::tuple<size_t,size_t,size_t,size_t> get_output_sizes() const {
-        const size_t input_planes = m_layers[0].channels;
-        size_t vbe_outputs = 0;
-        auto policy_conv_layer = get_layer_count() - 3;
-
-        if (m_layers[policy_conv_layer].is_convolve1) {
-            vbe_outputs = m_layers[policy_conv_layer+2].outputs;
-        } else {
-            policy_conv_layer++;
+    size_t get_value_head_end() const {
+        auto last_head_layer = size_t{0};
+        for ( auto i = size_t{0} ; i < get_layer_count() ; i++ ) {
+            if (m_layers[i].type == Layer::VALUE_CONV || m_layers[i].type == Layer::VALUE_AVGPOOL)
+                last_head_layer = i;
         }
+        assert(last_head_layer != get_layer_count());
 
-        const size_t policy_outputs = m_layers[policy_conv_layer].outputs;
-        const size_t val_outputs = m_layers[policy_conv_layer + 1].outputs;
+        return last_head_layer;
+    }
 
-        return std::make_tuple(input_planes, policy_outputs,
-                               val_outputs, vbe_outputs);
+    std::tuple<size_t,size_t,size_t> get_output_sizes() const {
+        const size_t input_planes = m_layers[0].channels;
+        const size_t val_outputs = m_layers[get_value_head_end()].outputs;
+
+        assert (m_layers.back().type == Layer::POL_CONV);
+        const size_t policy_outputs = m_layers.back().outputs;
+
+        return std::make_tuple(input_planes, policy_outputs, val_outputs);
     }
 
 private:
@@ -199,7 +214,9 @@ private:
                   cl::Buffer& bufferOutput,
                   cl::Buffer& bufferMerge,
                   weight_slice_t weights,
-                  int batch_size);
+                  weight_slice_t bn_weights,
+                  int batch_size,
+                  bool add_origin = false);
 
     OpenCL<net_t> & m_opencl;
 

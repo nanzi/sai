@@ -125,6 +125,9 @@ static constexpr auto KOMI = 7.0f;
 static constexpr auto PROGRAM_NAME = "SAI";
 static constexpr auto PROGRAM_VERSION = "0.18.2";
 
+static constexpr auto RESDENSE_IN_VALUE_HEAD = true;
+static constexpr auto RESCONV_IN_POLICY_HEAD = true;
+
 /*
  * OpenBLAS limitation: the default configuration on some Linuxes
  * is limited to 64 cores.

@@ -216,14 +216,11 @@ size_t Utils::ceilMultiple(size_t a, size_t b) {
     return ret;
 }
 
-float Utils::sigmoid_interval_avg(float alpkt, float beta, float s, float t) {
-    if (s>t) {
-        std::swap(s,t);
-    }
-    const auto h = beta * (t - s);
+float Utils::sigmoid_interval_avg(float alpkt, float beta, float beta2, float s, float t) {
+    const auto h = t - s;
 
-    if (h < 0.001f) {
-        return sigmoid(alpkt,beta,(s+t)/2).first;
+    if (std::abs(h) < 0.001f) {
+        return sigmoid(alpkt,beta,(s+t)/2.0f,beta2).first;
     }
 
     #ifndef NDEBUG
@@ -235,30 +232,40 @@ float Utils::sigmoid_interval_avg(float alpkt, float beta, float s, float t) {
     const auto a = std::abs(alpkt+s);
     const auto b = std::abs(alpkt+t);
 
-    const auto main_term = (alpkt+s)*(alpkt+t) > 0 ?
-        ( alpkt+s > 0 ? 1.0f : 0.0f ) :
-        0.5f + 0.5f*(b-a)/(t-s);
+    const double main_term = (alpkt+s)*(alpkt+t) > 0 ?
+        ( alpkt+s > 0 ? 1.0 : 0.0 ) :
+        0.5 + 0.5 * (b-a) / h;
 
-    const auto aa = log_sigmoid(a*beta) / h;
-    const auto bb = log_sigmoid(b*beta) / h;
+    if (beta2 < 0) {
+        const auto aa = log_sigmoid(a*beta);
+        const auto bb = log_sigmoid(b*beta);
 
-    //    myprintf("integral: alpkt=%f, beta=%f, s=%f, t=%f\n"
-    //       "h=%f, a=%f, b=%f, main_term=%f, aa=%f, bb=%f\n",
-    //       alpkt, beta, s, t, h, a, b, main_term, aa, bb);
-    return main_term - bb + aa;
+        return float(main_term + (aa - bb) / h / beta);
+    } else {
+        const auto cf_a = alpkt+s < 0 ? 1.0 / beta : 1.0 / beta2;
+        const auto cf_b = alpkt+t < 0 ? 1.0 / beta : 1.0 / beta2;
+        constexpr double log2 = 0.69314718055994530941723212145818;
+        const double delta_term = (alpkt+s)*(alpkt+t) > 0 ?
+                                    0.0 : (cf_a - cf_b) / h * log2;
+
+        const auto aa = log_sigmoid(a / cf_a) * cf_a;
+        const auto bb = log_sigmoid(b / cf_b) * cf_b;
+
+        return float(main_term + delta_term + (aa - bb) / h);
+    }
 }
 
-float Utils::log_sigmoid(float x) {
+double Utils::log_sigmoid(double x) {
     // Returns log(1/(1+exp(-x))
     // When sigmoid is about 1, log(sigmoid) is about 0 but not very precise
     // This function provides a robust estimate in that case.
-    // Its argument should be beta*(alpha+bonus)
-    if (x>10.0f) {
+    // Its argument should be beta*(alpha+bonus) and be positive.
+    if (x > 10.0) {
         const auto ul = std::exp(-x);
-        const auto ll = 1.0f/(1.0f+std::exp(x));
-        return -std::sqrt(ul*ll);
+        const auto ll = 1.0 / (1.0 + std::exp(x));
+        return -std::sqrt(ul * ll);
     }
-    return std::log(sigmoid(x,1.0f,0.0f).first);
+    return std::log(double(sigmoid(float(x), 1.0, 0.0).first));
 }
 
 float Utils::median(std::vector<float> & sample){

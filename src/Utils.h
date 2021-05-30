@@ -49,8 +49,8 @@ namespace Utils {
     void gtp_fail_printf(int id, const char *fmt, ...);
     void log_input(const std::string& input);
     bool input_pending();
-    float sigmoid_interval_avg(float alpkt, float beta, float s, float t);
-    float log_sigmoid(float x);
+    float sigmoid_interval_avg(float alpkt, float beta, float beta2, float s, float t);
+    double log_sigmoid(double x);
     float median(std::vector<float> & sample);
     float winner (float score);
     bool parse_agent_params(std::array<float, 4> &params, const std::string &str);

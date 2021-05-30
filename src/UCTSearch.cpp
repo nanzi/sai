@@ -129,7 +129,7 @@ UCTSearch::UCTSearch(GameState& g, Network& network)
 
 SearchResult SearchResult::from_node(const UCTNode* node, bool sai_head) {
     return SearchResult::from_eval(node->get_net_pi(), node->get_net_alpkt(),
-                                   node->get_net_beta(), sai_head);
+                                   node->get_net_beta(), node->get_net_beta2(), sai_head);
 }
 
 bool UCTSearch::advance_to_new_rootstate() {
@@ -271,6 +271,7 @@ SearchResult UCTSearch::play_simulation(GameState & currstate,
                 result = SearchResult::from_eval(node->get_net_pi(),
                                                  node->get_net_alpkt(),
                                                  node->get_net_beta(),
+                                                 node->get_net_beta2(),
                                                  m_network.m_value_head_sai);
 #ifndef NDEBUG
                 sminfo.leafstr = "Chn (net)";
@@ -279,7 +280,7 @@ SearchResult UCTSearch::play_simulation(GameState & currstate,
             } else {
                 auto score = currstate.final_score();
                 result = SearchResult::from_score(score, m_network.m_value_head_sai);
-                node->set_values(Utils::winner(score), score, 10.0f);
+                node->set_values(Utils::winner(score), score, 10.0f, 10.0f);
 #ifndef NDEBUG
                 sminfo.leafstr = "TT (score)";
                 sminfo.score = score;
@@ -291,13 +292,13 @@ SearchResult UCTSearch::play_simulation(GameState & currstate,
             }
 #endif
         } else {
-            float value, alpkt, beta;
+            float value, alpkt, beta, beta2;
             const auto had_children = node->has_children();
 
             // Careful: create_children() can throw a NetworkHaltException when
             // another thread requests draining the search.
             const auto success =
-                node->create_children(m_network, m_nodes, currstate, value, alpkt, beta,
+                node->create_children(m_network, m_nodes, currstate, value, alpkt, beta, beta2,
                                       get_min_psa_ratio());
             if (!had_children && success) {
 #ifdef USE_EVALCMD
@@ -305,7 +306,7 @@ SearchResult UCTSearch::play_simulation(GameState & currstate,
                     node->set_progid(m_nodecounter++);
                 }
 #endif
-                result = SearchResult::from_eval(value, alpkt, beta, m_network.m_value_head_sai);
+                result = SearchResult::from_eval(value, alpkt, beta, beta2, m_network.m_value_head_sai);
                 new_node = true;
 #ifndef NDEBUG
                 sminfo.leafstr = "new";
@@ -396,7 +397,8 @@ SearchResult UCTSearch::play_simulation(GameState & currstate,
         if (m_network.m_value_head_sai) {
             node->set_lambda_mu(savestate);
             node->update_all_quantiles(result_for_updating.get_alpkt(),
-                                       result_for_updating.get_beta());
+                                       result_for_updating.get_beta(),
+                                       result_for_updating.get_beta2());
         }
 
 #ifdef USE_EVALCMD
@@ -496,12 +498,11 @@ void UCTSearch::dump_stats(FastState & state, UCTNode & parent,
                 gmax = std::max(gmax, gchild.get_visits());
             }
             fracmax = gmax / float(node->get_visits());
+
+            // Needed for computing MCTS inefficiency
+            max_raw_eval = std::max(max_raw_eval, node->get_raw_eval(color));
         }
 
-        // Needed for computing MCTS inefficiency
-        max_raw_eval = std::max(max_raw_eval, node->get_raw_eval(color));
-
-#ifdef NDEBUG
         myprintf("%4s %7d %5d %3d  %5.2f%% %5.2f%% %5.*f%% %5.2f%% %5.2f%% %5.2f%% %5.1f %3.0f%% %s\n",
                  move.c_str(),
                  node->get_visits(),
@@ -517,20 +518,12 @@ void UCTSearch::dump_stats(FastState & state, UCTNode & parent,
                  -node->get_quantile_one(),
                  fracmax * 100.0f,
                  pv.c_str());
-#else
-        myprintf("%4s -> %7d (U: %5.2f%%, q: %5.2f%%, num: %5.2f, den: %4d) "
-                 "(V: %5.2f%%) (LCB: %8.5f%%) (N: %5.2f%%) (A: %4.1f) PV: %s\n",
-                 move.c_str(),
-                 node->get_visits(),
+#ifndef NDEBUG
+        myprintf("U: %5.2f%%, q: %5.2f%%, num: %5.2f, den: %4d\n",
                  node->get_urgency()[0] * 100.0f,
                  node->get_urgency()[2] * 100.0f,
                  node->get_urgency()[4],
-                 int(node->get_urgency()[3]),
-                 node->get_visits() ? node->get_raw_eval(color)*100.0f : 0.0f,
-                 node->get_eval_lcb(color) * 100.0f,
-                 node->get_policy() * 100.0f,
-                 -node->get_quantile_one(),
-                 pv.c_str());
+                 int(node->get_urgency()[3]));
 #endif
     }
     auto initial_visits_parent = 0;
@@ -1750,7 +1743,7 @@ void UCTSearch::set_visit_limit(int visits) {
 }
 
 float SearchResult::eval_with_bonus(float xbar, float xbase) const {
-    return Utils::sigmoid_interval_avg(m_alpkt, m_beta, xbase, xbar);
+    return Utils::sigmoid_interval_avg(m_alpkt, m_beta, m_beta2, xbase, xbar);
 }
 
 bool UCTSearch::is_better_move(int move1, int move2, float & estimated_score) {

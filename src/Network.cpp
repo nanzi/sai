@@ -225,340 +225,483 @@ std::vector<float> Network::winograd_transform_f(const std::vector<float>& f,
     return U;
 }
 
-//v1 refers to the actual weight file format, to be changed when/if the weight file format changes
+void Network::add_zero_channels() {
+    assert(m_val_outputs < 8);
+
+    const auto old_channels = m_val_outputs;
+    m_val_outputs = 8;
+
+    m_fwd_weights->m_conv_val_w.resize(m_channels*m_val_outputs, 0.0f);
+    m_fwd_weights->m_conv_val_b.resize(m_val_outputs, 0.0f);
+    m_fwd_weights->m_bn_val_w1.resize(m_val_outputs, 0.0f);
+    m_fwd_weights->m_bn_val_w2.resize(m_val_outputs, 0.0f);
+
+    m_fwd_weights->m_conv_val_pool_w.resize(m_val_outputs*m_val_pool_outputs, 0.0f);
+    for (auto i = m_val_pool_outputs - 1 ; ; i--) {
+        for (auto j = m_val_outputs ; j > old_channels ; j--) {
+            m_fwd_weights->m_conv_val_pool_w[i * m_val_outputs + j - 1] = 0.0f;
+        }
+        for (auto j = old_channels ; j > 0 ; j--) {
+            m_fwd_weights->m_conv_val_pool_w[i * m_val_outputs + j - 1]
+                = m_fwd_weights->m_conv_val_pool_w[i * old_channels + j - 1];
+        }
+        if (i == 0) break;
+    }
+}
+
+
+bool Network::read_weights_line(std::istream& wtfile,
+                                std::vector<float>& weights) {
+    auto line = std::string{};
+    weights.clear();
+
+    if (std::getline(wtfile, line)) {
+        auto it_line = line.cbegin();
+        const auto ok = phrase_parse(it_line, line.cend(),
+                                     *x3::float_, x3::space, weights);
+        if (ok && it_line == line.cend()) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool Network::read_weights_block(std::istream& wtfile,
+                                 std::array<std::vector<float>, 4> &layer,
+                                 WeightsFileIndex &id) {
+    // Reads up to 4 lines of the weights file.  Returns false if
+    // there are less than 4 lines in the buffer after that (i.e. if
+    // the end of file was reached).  If there is at least 1 line in
+    // the buffer, identifies and stores a new layer, leaving in the
+    // buffer any excess lines.
+
+    auto buffer_complete = true;
+    auto missing_lines = 0;
+    assert(id.excess < 4);
+    // read a layer of 4 lines
+    for (size_t i = 0 ; i < 4 ; i++) {
+        if (i < id.excess) {
+            // there are leftovers from previous read of 4 lines
+            layer[i] = std::move(layer[4 - id.excess + i]);
+        } else if (read_weights_line(wtfile, layer[i])) {
+            ++id.line;
+        } else {
+            layer[i].clear();
+            buffer_complete = false;
+            ++missing_lines;
+        }
+    }
+
+    if (missing_lines < 4) {
+        identify_layer(layer, id);
+        set_network_parameters(layer, id);
+        store_layer(layer, id);
+    }
+
+    return buffer_complete;
+}
+
+
+void Network::identify_layer(std::array<std::vector<float>, 4> &layer, WeightsFileIndex &id) {
+    id.previous = id.section;
+
+    switch(id.section) {
+
+    case NONE:
+        id.section = INPUT_CONV;
+        break;
+
+    case INPUT_CONV:
+        id.section = RESCONV_TOWER;
+        break;
+
+    case RESCONV_TOWER:
+        if (layer[0].size() == m_channels*9*m_channels) {
+            id.section = RESCONV_TOWER;
+        } else {
+            id.section = POL_CONV_TOWER;
+        }
+        break;
+
+    case POL_CONV_TOWER:
+        if (layer[1].size() == layer[3].size()) {
+            id.section = POL_CONV_TOWER;
+        } else {
+            id.section = POL_DENSE;
+        }
+        break;
+
+    case POL_DENSE:
+        id.section = VALUE_CONV;
+        break;
+
+    case VALUE_CONV:
+        if (layer[0].size() % NUM_INTERSECTIONS != 0) {
+            id.section = VALUE_AVGPOOL;
+            break;
+        }
+        // fall through
+
+    case VALUE_AVGPOOL:
+    case VALUE_DENSE_TOWER:
+        if (layer[1].size() == layer[3].size()) {
+            id.section = VALUE_DENSE_TOWER;
+        } else {
+            id.section = VAL_DENSE_HIDDEN;
+        }
+        break;
+
+    case VAL_DENSE_HIDDEN:
+        id.section = VAL_DENSE_OUT;
+        break;
+
+    case VAL_DENSE_OUT:
+        if (layer[2].size() > 0) {
+            id.section = VBE_DENSE_HIDDEN;
+        } else {
+            id.section = VBE_DENSE_OUT;
+        }
+        break;
+
+    case VBE_DENSE_HIDDEN:
+        id.section = VBE_DENSE_OUT;
+        break;
+
+    default:
+        break;
+    }
+}
+
+
+void Network::set_network_parameters(std::array<std::vector<float>, 4> &layer, WeightsFileIndex &id) {
+    switch(id.section) {
+
+    case INPUT_CONV:
+        // second line of weights, holds the biases for the
+        // input convolutional layer, hence its size gives
+        // the number of channels of subsequent resconv
+        // layers
+
+        m_channels = layer[1].size();    
+        // we recover the number of input planes
+        m_input_planes = layer[0].size()/9/m_channels;
+
+        // if it is even, color of the current player is
+        // used, if it is odd, only komi is used
+        m_include_color = (0 == m_input_planes % 2);
+
+        // we recover the number of input moves, knowing
+        // that for each move there are 2 bitplanes with
+        // stones positions and possibly 2 more bitplanes
+        // with some advanced features (legal and atari)
+        {
+            const auto feature_planes = 2 + (m_adv_features ? 2 : 0)
+                + (m_chainlibs_features ? CHAIN_LIBERTIES_PLANES : 0)
+                + (m_chainsize_features ? CHAIN_SIZE_PLANES : 0);
+            m_input_moves = (m_input_planes - (m_include_color ? 2 : 1)) / feature_planes;
+            assert(m_input_planes == m_input_moves * feature_planes + (m_include_color ? 2 : 1));
+
+            myprintf("%d input planes, %d input moves\n%d channels...",
+                     m_input_planes, m_input_moves, m_channels);
+        }
+
+        break;
+
+    case RESCONV_TOWER:
+        break;
+
+    case POL_CONV_TOWER:
+        if (id.section != id.previous) {
+            m_policy_outputs = m_policy_channels = layer[1].size();
+            m_residual_blocks = (m_fwd_weights->m_conv_biases.size()-1)/2;
+            assert(m_fwd_weights->m_conv_biases.size() == 1 + (2 * m_residual_blocks));
+
+            myprintf(" %d blocks.\n", m_residual_blocks);
+        } else {
+            m_policy_outputs = layer[1].size();
+        }
+
+        break;
+
+    case POL_DENSE:
+        m_policy_conv_layers = m_fwd_weights->m_conv_pol_b.size();
+
+        if (m_policy_conv_layers == 1) {
+            myprintf("Legacy policy convolution with %d filters.\n", m_policy_outputs);
+        } else {
+            myprintf("Policy resconv tower with %d channels,", m_policy_channels);
+            if (m_policy_channels != m_channels) {
+                myprintf(" 1+%d", (m_policy_conv_layers-1) / 2);
+            } else {
+                myprintf(" %d", m_policy_conv_layers / 2);
+            }
+            if (m_policy_channels != m_policy_outputs) {
+                myprintf("+1");
+            }
+            myprintf(" blocks and %d filters.\n", m_policy_outputs);
+        }
+            
+        break;
+
+    case VALUE_CONV:
+        m_val_outputs = layer[1].size();
+        m_val_dense_inputs = NUM_INTERSECTIONS * m_val_outputs;
+        break;
+
+    case VALUE_AVGPOOL:
+        m_val_dense_inputs = m_val_pool_outputs = layer[1].size();
+        myprintf("Value head pooling with %d channels.\n", m_val_pool_outputs);
+        break;
+
+    case VALUE_DENSE_TOWER:
+        if (id.section != id.previous) {
+            m_value_channels = layer[1].size();
+        }
+        break;
+
+    case VAL_DENSE_HIDDEN:
+        m_val_chans = layer[1].size();
+        if (m_vh_dense_weights.size()) {
+            const auto str_oddlayer = (m_vh_dense_weights.size() % 2) ? "1+" : "";
+            myprintf("Value head residual tower with %d channels and %s%d blocks.\n",
+                     m_value_channels, str_oddlayer, m_vh_dense_weights.size()/2);
+        }
+        break;
+
+    case VAL_DENSE_OUT:
+        m_value_head_rets = m_val_head_rets = layer[1].size();
+        assert (m_value_head_rets == 1 || m_value_head_rets == 2 || m_value_head_rets == 3);
+        if (m_value_head_rets == 1) {
+            m_value_head_type = SINGLE;
+        } else if (m_value_head_rets == 2 || m_value_head_rets == 3) {
+            m_value_head_type = DOUBLE_I;
+            m_val_head_rets = 1;
+            m_vbe_head_rets = m_value_head_rets - 1;
+        }
+        id.complete = true;
+        break;
+
+    case VBE_DENSE_HIDDEN:
+        assert (m_val_head_rets == 1);
+        m_value_head_type = DOUBLE_Y;
+        m_vbe_chans = layer[1].size();
+
+        myprintf("Double value head. Type Y.\n");
+        myprintf("Common convolution: %d filters.\n", m_val_outputs);
+        myprintf("Alpha head: %d channels. Beta head: %d channels.\n", m_val_chans, m_vbe_chans);
+        id.complete = false;
+        break;
+
+    case VBE_DENSE_OUT:
+        assert (m_val_head_rets == 1);
+        m_vbe_head_rets = layer[1].size();
+        assert (m_vbe_head_rets == 1 || m_vbe_head_rets == 2);
+        m_value_head_rets = m_val_head_rets + m_vbe_head_rets;
+
+        if (m_value_head_type != DOUBLE_Y) {
+            m_value_head_type = DOUBLE_T;
+
+            myprintf("Double value head. Type T.\n");
+            myprintf("Convolution with %d filters. Dense with %d channels.\n", m_val_outputs, m_val_chans);
+        }
+        id.complete = true;
+        break;
+
+    default:
+        break;
+    }
+    if (m_quartile_encoding && m_vbe_head_rets > 1) {
+        myprintf("\nMore than one beta head with quartile encoding is not supported!\n");
+        exit(EXIT_FAILURE);
+    }
+}
+
+
+void Network::print_network_details() {
+    if (m_value_head_type == SINGLE) {
+        myprintf("Single value head (LZ).\n");
+        myprintf("Convolution with %d filters. Dense with %d channels.\n", m_val_outputs, m_val_chans);
+    } else if (m_value_head_type == DOUBLE_I) {
+        myprintf("Double value head. Type I.\n");
+        myprintf("Convolution with %d filters. Dense with %d channels.\n", m_val_outputs, m_val_chans);
+    }
+    if (m_vbe_head_rets == 2) {
+        myprintf("Beta head with double output.\n");
+    }
+}
+
+
+void Network::store_layer(std::array<std::vector<float>, 4> &layer, WeightsFileIndex &id) {
+    switch(id.section) {
+
+    case INPUT_CONV:
+        assert (layer[0].size() == m_input_planes * 9 * m_channels);
+        assert (layer[1].size() == m_channels);
+        assert (layer[2].size() == m_channels);
+        assert (layer[3].size() == m_channels);
+        m_fwd_weights->m_conv_weights.emplace_back(layer[0]);
+        m_fwd_weights->m_conv_biases.emplace_back(layer[1]);
+        m_fwd_weights->m_batchnorm_means.emplace_back(layer[2]);
+        m_fwd_weights->m_batchnorm_stddevs.emplace_back(layer[3]);
+        id.excess = 0;
+        break;
+
+    case RESCONV_TOWER:
+        assert (layer[0].size() == m_channels * 9 * m_channels);
+        assert (layer[1].size() == m_channels);
+        assert (layer[2].size() == m_channels);
+        assert (layer[3].size() == m_channels);
+        m_fwd_weights->m_conv_weights.emplace_back(layer[0]);
+        m_fwd_weights->m_conv_biases.emplace_back(layer[1]);
+        m_fwd_weights->m_batchnorm_means.emplace_back(layer[2]);
+        m_fwd_weights->m_batchnorm_stddevs.emplace_back(layer[3]);
+        id.excess = 0;
+        break;
+
+    case POL_CONV_TOWER:
+        if (id.section != id.previous) {
+            assert (layer[0].size() == m_channels * m_policy_outputs);
+        } else {
+            assert (layer[0].size() == m_policy_channels * m_policy_outputs);
+        }
+        assert (layer[1].size() == m_policy_outputs);
+        assert (layer[2].size() == m_policy_outputs);
+        assert (layer[3].size() == m_policy_outputs);
+        m_fwd_weights->m_conv_pol_w.emplace_back(layer[0]);
+        m_fwd_weights->m_conv_pol_b.emplace_back(layer[1]);
+        m_fwd_weights->m_bn_pol_w1.emplace_back(layer[2]);
+        m_fwd_weights->m_bn_pol_w2.emplace_back(layer[3]);
+        id.excess = 0;
+        break;
+
+    case POL_DENSE:
+        if (layer[1].size() != POTENTIAL_MOVES) {
+            const auto netboardsize = std::sqrt(layer[1].size()-1);
+            myprintf("\nGiven network is for %.0fx%.0f, but this version "
+                     "of SAI was compiled for %dx%d board!\n",
+                     netboardsize, netboardsize, BOARD_SIZE, BOARD_SIZE);
+            exit(EXIT_FAILURE);
+        }
+        assert (layer[0].size() == m_policy_outputs * NUM_INTERSECTIONS * POTENTIAL_MOVES);
+        assert (layer[1].size() == POTENTIAL_MOVES);
+        m_ip_pol_w = std::move(layer[0]);
+        m_ip_pol_b = std::move(layer[1]);
+        id.excess = 2;
+        break;
+
+    case VALUE_CONV:
+        assert (layer[0].size() == m_channels * m_val_outputs);
+        assert (layer[1].size() == m_val_outputs);
+        assert (layer[2].size() == m_val_outputs);
+        assert (layer[3].size() == m_val_outputs);
+        m_fwd_weights->m_conv_val_w = std::move(layer[0]);
+        m_fwd_weights->m_conv_val_b = std::move(layer[1]);
+        m_fwd_weights->m_bn_val_w1 = std::move(layer[2]);
+        m_fwd_weights->m_bn_val_w2 = std::move(layer[3]);
+        id.excess = 0;
+        break;
+
+    case VALUE_AVGPOOL:
+        assert (layer[0].size() == m_val_outputs * m_val_pool_outputs);
+        assert (layer[1].size() == m_val_pool_outputs);
+        assert (layer[2].size() == m_val_pool_outputs);
+        assert (layer[3].size() == m_val_pool_outputs);
+        m_fwd_weights->m_conv_val_pool_w = std::move(layer[0]);
+        m_fwd_weights->m_conv_val_pool_b = std::move(layer[1]);
+        m_fwd_weights->m_bn_val_pool_w1 = std::move(layer[2]);
+        m_fwd_weights->m_bn_val_pool_w2 = std::move(layer[3]);
+        if (m_val_outputs < 8) {
+            add_zero_channels();
+        }
+        id.excess = 0;
+        break;
+
+    case VALUE_DENSE_TOWER:
+        if (id.section != id.previous) {
+            assert (layer[0].size() == m_val_dense_inputs * m_value_channels);
+        } else {
+            assert (layer[0].size() == m_value_channels * m_value_channels);
+        }
+        assert (layer[1].size() == m_value_channels);
+        assert (layer[2].size() == m_value_channels);
+        assert (layer[3].size() == m_value_channels);
+        m_vh_dense_weights.emplace_back(layer[0]);
+        m_vh_dense_biases.emplace_back(layer[1]);
+        m_vh_dense_bn_means.emplace_back(layer[2]);
+        m_vh_dense_bn_vars.emplace_back(layer[3]);
+        id.excess = 0;
+        break;
+
+    case VAL_DENSE_HIDDEN:
+        if (m_vh_dense_weights.size()) {
+            assert (layer[0].size() == m_value_channels * m_val_chans);
+        } else {
+            assert (layer[0].size() == m_val_dense_inputs * m_val_chans);
+        }
+        assert (layer[1].size() == m_val_chans);
+        m_ip1_val_w = std::move(layer[0]);
+        m_ip1_val_b = std::move(layer[1]);
+        id.excess = 2;
+        break;
+
+    case VAL_DENSE_OUT:
+        assert (layer[0].size() == m_val_chans * m_value_head_rets);
+        assert (layer[1].size() == m_value_head_rets);
+        m_ip2_val_w = std::move(layer[0]);
+        m_ip2_val_b = std::move(layer[1]);
+        id.excess = 2;
+        break;
+
+    case VBE_DENSE_HIDDEN:
+        if (m_vh_dense_weights.size()) {
+            assert (layer[0].size() == m_value_channels * m_vbe_chans);
+        } else {
+            assert (layer[0].size() == m_val_dense_inputs * m_vbe_chans);
+        }
+        assert (layer[1].size() == m_vbe_chans);
+        m_ip1_vbe_w = std::move(layer[0]);
+        m_ip1_vbe_b = std::move(layer[1]);
+        id.excess = 2;
+        break;
+
+    case VBE_DENSE_OUT:
+        if (m_ip1_vbe_w.size()) {
+            assert (layer[0].size() == m_vbe_chans * m_vbe_head_rets);
+        } else {
+            assert (layer[0].size() == m_val_chans * m_vbe_head_rets);
+        }
+        assert (layer[1].size() == m_vbe_head_rets);
+        m_ip2_vbe_w = std::move(layer[0]);
+        m_ip2_vbe_b = std::move(layer[1]);
+        id.excess = 2;
+        break;
+
+    default:
+        break;
+    }
+}
+
+
 int Network::load_v1_network(std::istream& wtfile, int format_version) {
     // Count size of the network
     myprintf("Detecting residual layers... v%d\n", format_version);
 
-    auto komipolicy_lines = 0;
-    m_komipolicy_chans = 0;
-    if (format_version == 49) {
-        // in this format there are 4 additional lines between policy
-        // 1x1 convolution and policy dense layer
+    std::array<std::vector<float>, 4> layer;
+    WeightsFileIndex id;
 
-        komipolicy_lines = 4;
-    }
+    while(read_weights_block(wtfile, layer, id));
 
-    // First line was the version number
-    auto linecount = size_t{1};
-    int lastlines = 0;
-    auto line = std::string{};
-    size_t plain_conv_layers = 0;
-    size_t plain_conv_wts = 0;
-    std::array<std::vector<float>, 8> wts_2nd_val_head;
-    std::array<std::vector<float>::size_type, 8> n_wts_2nd_val_head;
-
-    bool is_head_line = false;
-    linecount = 0;
-    auto n_wts_1st_layer = size_t{0};
-
-    while (std::getline(wtfile, line)) {
-        std::vector<float> weights;
-        auto it_line = line.cbegin();
-        const auto ok = phrase_parse(it_line, line.cend(),
-                                     *x3::float_, x3::space, weights);
-        if (!ok || it_line != line.cend()) {
-            myprintf("\nFailed to parse weight file. Error on line %d.\n",
-                    linecount + 2); //+1 from version line, +1 from 0-indexing
-            return 1;
-        }
-        auto n_wts = weights.size();
-        if (!is_head_line) {
-            // we should be still in the convolutional tower
-            // (or we just exit)
-
-            if (linecount % 4 == 0) {
-                // first line of 4: holds convolutional weights
-
-                if (linecount == 0)
-                    n_wts_1st_layer = n_wts;
-                // check if we are still in the resconv tower
-                if (linecount==0 || n_wts==m_channels*9*m_channels)
-                    // yes: these are convolutional weights
-                    m_fwd_weights->m_conv_weights.emplace_back(weights);
-                else {
-                    // no: first line of policy head [1x1 conv weights]
-                is_head_line = true;
-                m_policy_outputs = n_wts/m_channels;
-                assert (n_wts == m_channels*m_policy_outputs);
-                m_fwd_weights->m_conv_pol_w = std::move(weights);
-                m_residual_blocks = (linecount-4)/8;
-                plain_conv_layers = 1 + (m_residual_blocks * 2);
-                plain_conv_wts = plain_conv_layers * 4;
-                assert(plain_conv_wts == linecount);
-                myprintf(" %d blocks\n%d policy outputs. ", m_residual_blocks, m_policy_outputs);
-              }
-            } else if (linecount % 4 == 1) {
-                // second line of 4: holds convolutional biases
-
-                if (linecount == 1) {
-                  // second line of weights, holds the biases for the
-                  // input convolutional layer, hence its size gives
-                  // the number of channels of subsequent resconv
-                  // layers
-                  m_channels = n_wts;
-
-                  // we recover the number of input planes
-                  m_input_planes = n_wts_1st_layer/9/m_channels;
-
-                  // if it is even, color of the current player is
-                  // used, if it is odd, only komi is used
-                  m_include_color = (0 == m_input_planes % 2);
-
-                  // we recover the number of input moves, knowing
-                  // that for each move there are 2 bitplanes with
-                  // stones positions and possibly 2 more bitplanes
-                  // with some advanced features (legal and atari)
-                  const auto feature_planes = 2 + (m_adv_features ? 2 : 0)
-                      + (m_chainlibs_features ? CHAIN_LIBERTIES_PLANES : 0)
-                      + (m_chainsize_features ? CHAIN_SIZE_PLANES : 0);
-                  m_input_moves = (m_input_planes - (m_include_color ? 2 : 1)) /
-                      feature_planes;
-
-                  assert (n_wts_1st_layer == m_input_planes*9*m_channels);
-                  myprintf("%d input planes, %d input moves\n%d channels...",
-                           m_input_planes,
-                           m_input_moves,
-                           m_channels);
-              }
-              else
-                assert (n_wts == m_channels);
-
-              m_fwd_weights->m_conv_biases.emplace_back(weights);
-            } else if (linecount % 4 == 2) {
-                assert (n_wts == m_channels);
-                m_fwd_weights->m_batchnorm_means.emplace_back(weights);
-            } else if (linecount % 4 == 3) {
-                assert (n_wts == m_channels);
-                process_bn_var(weights);
-                m_fwd_weights->m_batchnorm_stddevs.emplace_back(weights);
-            }
-        } else if (linecount == plain_conv_wts + 1) {
-        // line 2 of policy head [1x1 convolutional biases]
-        assert (n_wts == m_policy_outputs);
-            m_fwd_weights->m_conv_pol_b = std::move(weights);
-        } else if (linecount == plain_conv_wts + 2) {
-            // line 3 of policy head [1x1 convolutional bn 1]
-            assert (n_wts == m_policy_outputs);
-            m_bn_pol_w1 = std::move(weights);
-        } else if (linecount == plain_conv_wts + 3) {
-            // line 4 of policy head [1x1 convolutional bn 2]
-
-            process_bn_var(weights);
-            assert (n_wts == m_policy_outputs);
-            m_bn_pol_w2 = std::move(weights);
-
-            // if the net has 'komi policy' layers, then their weigths
-            // go here
-        } else if (komipolicy_lines && linecount == plain_conv_wts + 4) {
-            // line 1 of komi policy layers
-
-            m_komipolicy_chans = n_wts /
-                (NUM_INTERSECTIONS * m_policy_outputs + 1);
-            assert (n_wts == (NUM_INTERSECTIONS * m_policy_outputs + 1)
-                    * m_komipolicy_chans);
-            m_kp1_pol_w = std::move(weights);
-        } else if (komipolicy_lines && linecount == plain_conv_wts + 5) {
-            // line 2 of komi policy layers
-
-            assert (n_wts == m_komipolicy_chans);
-            m_kp1_pol_b = std::move(weights);
-        } else if (komipolicy_lines && linecount == plain_conv_wts + 6) {
-            // line 3 of komi policy layers
-
-            assert (n_wts == m_komipolicy_chans * m_komipolicy_chans);
-            m_kp2_pol_w = std::move(weights);
-        } else if (komipolicy_lines && linecount == plain_conv_wts + 7) {
-            // line 4 of komi policy layers
-
-            assert (n_wts == m_komipolicy_chans);
-            m_kp2_pol_b = std::move(weights);
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 4) {
-            // line [-2] of policy head [dense layer weights]
-
-            // we do not check the board size here as it would be
-            // uselessly complicate
-
-            assert (n_wts == (m_policy_outputs * NUM_INTERSECTIONS
-                              + (m_komi_policy ? 1 : 0)
-                              * m_komipolicy_chans ) // assumes this is 0 when
-                                                     // komi policy is not used)
-                              * POTENTIAL_MOVES );
-
-                m_ip_pol_w = std::move(weights);
-
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 5) {
-            // line [-1] of policy head [dense layer biases]
-            // check if the board size is correct
-
-            if (n_wts != POTENTIAL_MOVES) {
-                const auto netboardsize = std::sqrt(n_wts-1);
-                myprintf("\nGiven network is for %.0fx%.0f, but this version "
-                         "of SAI was compiled for %dx%d board!\n",
-                         netboardsize, netboardsize, BOARD_SIZE, BOARD_SIZE);
-                return 1;
-            }
-
-            m_ip_pol_b = std::move(weights);
-
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 6) {
-            // line 1 of value head [1x1 convolutional weights]
-            m_val_outputs = n_wts/m_channels;
-            assert (n_wts == m_channels*m_val_outputs);
-            m_fwd_weights->m_conv_val_w = std::move(weights);
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 7) {
-            // line 2 of value head [1x1 convolutional biases]
-            assert (n_wts == m_val_outputs);
-            m_fwd_weights->m_conv_val_b = std::move(weights);
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 8) {
-            // line 3 of value head [1x1 convolutional bn 1]
-            assert (n_wts == m_val_outputs);
-            m_bn_val_w1 = std::move(weights);
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 9) {
-            // line 4 of value head [1x1 convolutional bn 2]
-            assert (n_wts == m_val_outputs);
-            process_bn_var(weights);
-            m_bn_val_w2 = std::move(weights);
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 10) {
-            // line 5 of value head [dense layer weights]
-
-            m_val_chans = n_wts/m_val_outputs/NUM_INTERSECTIONS;
-            assert (n_wts == m_val_chans*m_val_outputs*NUM_INTERSECTIONS);
-            m_ip1_val_w = std::move(weights);
-
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 11) {
-            // line 6 of value head [dense layer biases]
-
-            assert (n_wts == m_val_chans);
-            m_ip1_val_b = std::move(weights);
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 12) {
-            // line 7 of value head [last unit(s) weights]
-
-            m_value_head_rets = n_wts/m_val_chans;
-            assert (n_wts == m_val_chans*m_value_head_rets);
-            assert (m_value_head_rets == 1 || m_value_head_rets == 2);
-            m_ip2_val_w = std::move(weights);
-
-        } else if (linecount == plain_conv_wts + komipolicy_lines + 13) {
-            // line 8 of value head [last unit(s) biases]
-
-            assert (n_wts == m_value_head_rets);
-            m_ip2_val_b = std::move(weights);
-
-        } else if (linecount >= plain_conv_wts + komipolicy_lines + 14) {
-            // read the second value head, if present, store it
-            // temporarily and count how many lines long it is
-
-            auto i = lastlines;
-            assert (i>=0 && i<8);
-            wts_2nd_val_head[i] = std::move(weights);
-            n_wts_2nd_val_head[i] = n_wts;
-            lastlines++;
-        }
-        linecount++;
-    }
-
-    if (lastlines == 8) {
-        m_value_head_type = DOUBLE_V;
-        m_value_head_rets = 2;
-
-        m_vbe_outputs = n_wts_2nd_val_head[0]/m_channels;
-        assert (n_wts_2nd_val_head[0] == m_channels*m_vbe_outputs);
-        m_fwd_weights->m_conv_vbe_w = std::move(wts_2nd_val_head[0]);
-
-        assert (n_wts_2nd_val_head[1] == m_vbe_outputs);
-        m_fwd_weights->m_conv_vbe_b = std::move(wts_2nd_val_head[1]);
-
-        assert (n_wts_2nd_val_head[2] == m_vbe_outputs);
-        m_bn_vbe_w1 = std::move(wts_2nd_val_head[2]);
-
-        assert (n_wts_2nd_val_head[3] == m_vbe_outputs);
-        process_bn_var(wts_2nd_val_head[3]);
-        m_bn_vbe_w2 = std::move(wts_2nd_val_head[3]);
-
-        m_vbe_chans = n_wts_2nd_val_head[4]/m_vbe_outputs/(NUM_INTERSECTIONS);
-        assert (n_wts_2nd_val_head[4] == m_vbe_chans*m_vbe_outputs*NUM_INTERSECTIONS);
-        m_ip1_vbe_w = std::move(wts_2nd_val_head[4]);
-
-        assert (n_wts_2nd_val_head[5] == m_vbe_chans);
-        m_ip1_vbe_b = std::move(wts_2nd_val_head[5]);
-
-        int ret2 = n_wts_2nd_val_head[6]/m_vbe_chans;
-        assert (n_wts_2nd_val_head[6] == m_vbe_chans*ret2);
-        if (ret2 != 1) {
-          myprintf ("Unexpected in weights file: ret2=%d. %d -- %d -- %d.\n",
-                    ret2,
-                    n_wts_2nd_val_head[6],
-                    m_vbe_chans,
-                    n_wts_2nd_val_head[6]/m_vbe_chans);
-          return 1;
-        }
-        m_ip2_vbe_w = std::move(wts_2nd_val_head[6]);
-
-        assert (n_wts_2nd_val_head[7] == 1);
-        m_ip2_vbe_b = std::move(wts_2nd_val_head[7]);
-
-        myprintf("Double value head. Type V.\n");
-        myprintf("Alpha head: %d outputs, %d channels.\n", m_val_outputs, m_val_chans);
-        myprintf("Beta head: %d outputs, %d channels.\n", m_vbe_outputs, m_vbe_chans);
-    } else if (lastlines == 4) {
-        m_value_head_type = DOUBLE_Y;
-        m_value_head_rets = 2;
-
-        m_vbe_chans = n_wts_2nd_val_head[0]/m_val_outputs/(NUM_INTERSECTIONS);
-        assert (n_wts_2nd_val_head[0] == m_vbe_chans*m_val_outputs*NUM_INTERSECTIONS);
-        m_ip1_vbe_w = std::move(wts_2nd_val_head[0]);
-
-        assert (n_wts_2nd_val_head[1] == m_vbe_chans);
-        m_ip1_vbe_b = std::move(wts_2nd_val_head[1]);
-
-        int ret2 = n_wts_2nd_val_head[2]/m_vbe_chans;
-        assert (n_wts_2nd_val_head[2] == m_vbe_chans*ret2);
-        if (ret2 != 1)
-          return 1;
-        m_ip2_vbe_w = std::move(wts_2nd_val_head[2]);
-
-        assert (n_wts_2nd_val_head[3] == 1);
-        m_ip2_vbe_b = std::move(wts_2nd_val_head[3]);
-
-        myprintf("Double value head. Type Y.\n");
-        myprintf("Common convolution: %d outputs.\n", m_val_outputs);
-        myprintf("Alpha head: %d channels. Beta head: %d channels.\n", m_val_chans, m_vbe_chans);
-    } else if (lastlines == 2) {
-        m_value_head_type = DOUBLE_T;
-        m_value_head_rets = 2;
-
-        int ret2 = n_wts_2nd_val_head[0]/m_val_chans;
-        assert (n_wts_2nd_val_head[0] == m_val_chans*ret2);
-        if (ret2 != 1)
-          return 1;
-        m_ip2_vbe_w = std::move(wts_2nd_val_head[0]);
-
-        assert (n_wts_2nd_val_head[1] == 1);
-        m_ip2_vbe_b = std::move(wts_2nd_val_head[1]);
-
-        myprintf("Double value head. Type T: %d outputs, %d channels.\n",
-                 m_val_outputs, m_val_chans);
-    } else if (lastlines == 0) {
-        if (m_value_head_rets == 2) {
-          m_value_head_type = DOUBLE_I;
-
-          myprintf("Double value head. Type I: %d outputs, %d channels.\n",
-                   m_val_outputs, m_val_chans);
-        }
-        else if (m_value_head_rets == 1) {
-          m_value_head_type = SINGLE;
-
-          myprintf("Single value head: %d outputs, %d channels.\n",
-                   m_val_outputs, m_val_chans);
-        }
+    if (id.complete) {
+        print_network_details();
     } else {
-      myprintf ("\nFailed to parse weight file.\n");
-      return 1;
+        myprintf("\Error in reading network file at line %d.\n", id.line);
+        return 1;
     }
 
     return 0;
 }
+
 int Network::load_network_file(const std::string& filename) {
     // gzopen supports both gz and non-gz files, will decompress
     // or just read directly as needed.
@@ -592,10 +735,11 @@ int Network::load_network_file(const std::string& filename) {
         // First line is the file format version id
         iss >> format_version;
         m_adv_features = bool(format_version & 16);
-        m_komi_policy = bool(format_version & 32);
+        //        m_komi_policy = bool(format_version & 32);
         m_chainlibs_features = bool(format_version & 64);
         m_chainsize_features = bool(format_version & 128);
-        auto extra_bits = format_version - (format_version & 255);
+        m_quartile_encoding = bool(format_version & 256);
+        auto extra_bits = format_version - (format_version & 511);
         auto lz_or_elf = format_version & 3;
         if (iss.fail() || (lz_or_elf != 1 && lz_or_elf != 2) || extra_bits != 0) {
             myprintf("Weights file is the wrong version.\n");
@@ -624,16 +768,16 @@ int Network::load_network_file(const std::string& filename) {
                 myprintf("%sadvanced board features", conj);
                 conj = plusconj;
             }
-            if (m_komi_policy) {
-                myprintf("%skomi policy", conj);
-                conj = plusconj;
-            }
             if (m_chainlibs_features) {
                 myprintf("%schain liberties", conj);
                 conj = plusconj;
             }
             if (m_chainsize_features) {
                 myprintf("%schain size", conj);
+                conj = plusconj;
+            }
+            if (m_quartile_encoding) {
+                myprintf("%squartile encoding", conj);
             }
             if (open_parenthesis) {
                     myprintf(")");
@@ -807,23 +951,38 @@ void Network::initialize(int playouts, const std::string & weightsfile) {
             m_fwd_weights->m_batchnorm_means[i][j] -= m_fwd_weights->m_conv_biases[i][j];
             m_fwd_weights->m_conv_biases[i][j] = 0.0f;
         }
+        process_bn_var(m_fwd_weights->m_batchnorm_stddevs[i]);
     }
 
-    for (auto i = size_t{0}; i < m_bn_val_w1.size(); i++) {
-        m_bn_val_w1[i] -= m_fwd_weights->m_conv_val_b[i];
+    for (auto i = size_t{0}; i < m_fwd_weights->m_bn_val_w1.size(); i++) {
+        m_fwd_weights->m_bn_val_w1[i] -= m_fwd_weights->m_conv_val_b[i];
         m_fwd_weights->m_conv_val_b[i] = 0.0f;
     }
+    process_bn_var(m_fwd_weights->m_bn_val_w2);
 
-    for (auto i = size_t{0}; i < m_bn_vbe_w1.size(); i++) {
-        m_bn_vbe_w1[i] -= m_fwd_weights->m_conv_vbe_b[i];
-        m_fwd_weights->m_conv_vbe_b[i] = 0.0f;
+    for (auto i = size_t{0}; i < m_fwd_weights->m_bn_val_pool_w1.size(); i++) {
+        m_fwd_weights->m_bn_val_pool_w1[i] -= m_fwd_weights->m_conv_val_pool_b[i];
+        m_fwd_weights->m_conv_val_pool_b[i] = 0.0f;
+    }
+    process_bn_var(m_fwd_weights->m_bn_val_pool_w2);
+
+    for (auto i = size_t{0}; i < m_fwd_weights->m_conv_pol_b.size(); i++) {
+        for (auto j = size_t{0}; j < m_fwd_weights->m_conv_pol_b[i].size(); j++) {
+            m_fwd_weights->m_bn_pol_w1[i][j] -= m_fwd_weights->m_conv_pol_b[i][j];
+            m_fwd_weights->m_conv_pol_b[i][j] = 0.0f;
+        }
+        process_bn_var(m_fwd_weights->m_bn_pol_w2[i]);
     }
 
-    for (auto i = size_t{0}; i < m_bn_pol_w1.size(); i++) {
-        m_bn_pol_w1[i] -= m_fwd_weights->m_conv_pol_b[i];
-        m_fwd_weights->m_conv_pol_b[i] = 0.0f;
+    for (auto i = size_t{0}; i < m_vh_dense_biases.size(); i++) {
+        for (auto j = size_t{0}; j < m_vh_dense_biases[i].size(); j++) {
+            m_vh_dense_bn_means[i][j] -= m_vh_dense_biases[i][j];
+            m_vh_dense_biases[i][j] = 0.0f;
+        }
+        process_bn_var(m_vh_dense_bn_vars[i]);
     }
 
+ 
 #ifdef USE_OPENCL
     if (cfg_cpu_only) {
         myprintf("Initializing CPU-only evaluation.\n");
@@ -862,6 +1021,7 @@ std::vector<float> innerproduct(const std::vector<float>& input,
     const auto inputs = input.size();
     const auto outputs = biases.size();
     std::vector<float> output(outputs);
+    //    myprintf("***ip: %d * %d == %d\n", inputs, outputs, weights.size());
     assert(inputs*outputs == weights.size());
 #ifdef USE_BLAS
     cblas_sgemv(CblasRowMajor, CblasNoTrans,
@@ -887,7 +1047,6 @@ std::vector<float> innerproduct(const std::vector<float>& input,
         }
         output[o] = val;
     }
-
     return output;
 }
 
@@ -967,18 +1126,19 @@ std::vector<float> softmax(const std::vector<float>& input,
     return output;
 }
 
-std::pair<float,float> sigmoid(float alpha, float beta, float bonus) {
-    const auto arg = beta*(alpha+bonus);
-    const auto absarg = std::abs(arg);
-    float ret;
-
-    if (absarg > 30.0f) {
-        ret = std::exp(-absarg);
-    } else {
-        ret = 1.0f/(1.0f+std::exp(absarg));
+std::pair<float,float> sigmoid(float alpha, float beta, float bonus, float beta2) {
+    if (beta2 < 0) {
+        beta2 = beta;
     }
-    return arg<0 ? std::make_pair(ret, 1.0f-ret)
-               : std::make_pair(1.0f-ret, ret);
+    const double arg = (alpha+bonus > 0 ? beta2 : beta) * (alpha+bonus);
+    const auto absarg = std::abs(arg);
+    const auto ret = (absarg > 30) ?
+        std::exp(-absarg) :
+        1.0 / (1.0 + std::exp(absarg));
+
+    return (arg < 0) ?
+        std::make_pair(float(ret), float(1.0 - ret)) :
+        std::make_pair(float(1.0 - ret), float(ret));
 }
 
 bool Network::probe_cache(const GameState* const state,
@@ -1009,13 +1169,21 @@ bool Network::probe_cache(const GameState* const state,
     }
 
     if (cache_success && result.is_sai) {
-        const auto komi = state->get_komi_adj();
-        const auto white = (FastBoard::WHITE == state->get_to_move());
-        result.value = sigmoid(result.alpha, result.beta, white ? komi : -komi).first;
+        get_sai_winrate(result, state);
     }
 
     return cache_success;
 }
+
+
+float Network::get_sai_winrate(Network::Netresult& result,
+                               const GameState* const state) {
+    const auto komi = state->get_komi_adj();
+    const auto white = (FastBoard::WHITE == state->get_to_move());
+    result.value = sigmoid(result.alpha, result.beta, white ? komi : -komi, result.beta2).first;
+    return result.value;
+}
+
 
 Network::Netresult Network::get_output(const GameState* const state,
                                        const Ensemble ensemble,
@@ -1047,6 +1215,7 @@ Network::Netresult Network::get_output(const GameState* const state,
             result.value += tmpresult.value / static_cast<float>(NUM_SYMMETRIES);;
             result.alpha += tmpresult.alpha / static_cast<float>(NUM_SYMMETRIES);;
             result.beta += tmpresult.beta / static_cast<float>(NUM_SYMMETRIES);;
+            result.beta2 += tmpresult.beta2 / static_cast<float>(NUM_SYMMETRIES);;
             result.is_sai = tmpresult.is_sai;
 
             for (auto idx = size_t{0}; idx < NUM_INTERSECTIONS; idx++) {
@@ -1094,6 +1263,37 @@ Network::Netresult Network::get_output(const GameState* const state,
     return result;
 }
 
+// void Network::dump_array(std::string name, std::vector<float> &array) {
+//     auto maxvalue = array[0];
+//     auto minvalue = array[0];
+//     for (auto x : array) {
+//         maxvalue = std::max(maxvalue, x);
+//         minvalue = std::min(minvalue, x);
+//     }
+//     myprintf("%s, min: %f, max: %f\n", name.c_str(), minvalue, maxvalue);
+//     for (int i=0; i<std::min(20, int(array.size())); i++) {
+//         myprintf("%.3f\t", array[i]);
+//     }
+//     myprintf("\n");
+// }
+
+
+void Network::reduce_mean(std::vector<float> &layer, size_t area) {
+    const auto channels = layer.size() / area;
+    assert (area * channels == layer.size());
+
+    std::vector<float> output(channels);
+    for (auto c = size_t{0} ; c < channels ; c++) {
+        output[c] = 0.0f;
+        for (auto i = size_t{0} ; i < area ; i++) {
+            output[c] += layer[area*c + i];
+        }
+        output[c] /= area;
+    }
+    layer = std::move(output);
+}
+
+
 Network::Netresult Network::get_output_internal(
     const GameState* const state, const int symmetry, bool selfcheck) {
     assert(symmetry >= 0 && symmetry < NUM_SYMMETRIES);
@@ -1104,50 +1304,59 @@ Network::Netresult Network::get_output_internal(
     // color of the current player is encoded in the last two planes
     const auto include_color = (0 == m_input_planes % 2);
 
-    //    myprintf("get_output_internal() -> m_chainlibs_features=%d\n", m_chainlibs_features);
     const auto input_data = gather_features(state, symmetry, m_input_moves,
                                             m_adv_features, m_chainlibs_features,
                                             m_chainsize_features, include_color);
     std::vector<float> policy_data(m_policy_outputs * width * height);
-    std::vector<float> val_data(m_val_outputs * width * height);
-    std::vector<float> vbe_data(m_vbe_outputs * width * height);
+    const auto value_outputs = (m_val_pool_outputs > 0) ? m_val_pool_outputs : m_val_outputs;
+    std::vector<float> val_data(value_outputs * width * height);
+
 #ifdef USE_OPENCL_SELFCHECK
     if (selfcheck) {
-        m_forward_cpu->forward(input_data, policy_data, val_data, vbe_data);
+        m_forward_cpu->forward(input_data, policy_data, val_data);
     } else {
-        m_forward->forward(input_data, policy_data, val_data, vbe_data);
+        m_forward->forward(input_data, policy_data, val_data);
     }
 #else
-    m_forward->forward(input_data, policy_data, val_data, vbe_data);
+    m_forward->forward(input_data, policy_data, val_data);
     (void) selfcheck;
 #endif
 
     // Get the moves
-    batchnorm<NUM_INTERSECTIONS>(m_policy_outputs, policy_data,
-        m_bn_pol_w1.data(), m_bn_pol_w2.data());
-
-    if (m_komi_policy) {
-        float komi = state->get_komi();
-        komi *= ( state->get_to_move() == FastBoard::BLACK ? -1.0 : 1.0 );
-        policy_data.push_back(komi);
-        const auto kp1 =
-            innerproduct<true>(policy_data, m_kp1_pol_w, m_kp1_pol_b);
-        const auto kp2 =
-            innerproduct<true>(kp1, m_kp2_pol_w, m_kp2_pol_b);
-        policy_data.pop_back();
-        for (auto & i : kp2) {
-            policy_data.push_back(i);
-        }
-    }
-
     const auto policy_out =
         innerproduct<false>(
             policy_data, m_ip_pol_w, m_ip_pol_b);
     const auto outputs = softmax(policy_out, cfg_softmax_temp);
 
     // Now get the value
-    batchnorm<NUM_INTERSECTIONS>(m_val_outputs, val_data,
-        m_bn_val_w1.data(), m_bn_val_w2.data());
+    if (m_val_pool_outputs) {
+        reduce_mean(val_data, width * height);
+    }
+    std::vector<float> res(val_data.size());
+    unsigned int parity = 0;
+    for (auto i = size_t{0} ; i<m_vh_dense_weights.size() ; i++) {
+        if (i == 0 && val_data.size() != m_vh_dense_biases[0].size()) {
+            val_data = innerproduct<false>(val_data, m_vh_dense_weights[i],
+                                           m_vh_dense_biases[i]);
+            batchnorm<1>(m_vh_dense_biases[i].size(), val_data,
+                         m_vh_dense_bn_means[i].data(), m_vh_dense_bn_vars[i].data());
+            parity = 1;
+        } else if (!RESDENSE_IN_VALUE_HEAD || i % 2 == parity) {
+            std::swap(val_data, res);
+            val_data = innerproduct<false>(res, m_vh_dense_weights[i],
+                                           m_vh_dense_biases[i]);
+            batchnorm<1>(m_vh_dense_biases[i].size(), val_data,
+                         m_vh_dense_bn_means[i].data(), m_vh_dense_bn_vars[i].data());
+        } else {
+            val_data = innerproduct<false>(val_data, m_vh_dense_weights[i],
+                                           m_vh_dense_biases[i]);
+            batchnorm<1>(m_vh_dense_biases[i].size(), val_data,
+                         m_vh_dense_bn_means[i].data(), m_vh_dense_bn_vars[i].data(),
+                         res.data());
+        }
+        
+    }
+
     const auto val_channels =
         innerproduct<true>(
             val_data, m_ip1_val_w, m_ip1_val_b);
@@ -1155,8 +1364,6 @@ Network::Netresult Network::get_output_internal(
         innerproduct<false>(val_channels, m_ip2_val_w, m_ip2_val_b);
 
     Netresult result;
-    // ln(x) = log2(x) * ln(2)
-    const auto beta_nat_tune = cfg_betatune * 0.69314718056;
 
     if (m_value_head_type==SINGLE) {
         result.alpha = 2 * val_output[0]; // logits of the winrate for LZ networks
@@ -1164,37 +1371,53 @@ Network::Netresult Network::get_output_internal(
         result.value = sigmoid(result.alpha, 1, 0).first;
         result.is_sai = false;
     } else {
-        if (m_value_head_type==DOUBLE_V) {
-            // If double head value, also get beta
-            batchnorm<NUM_INTERSECTIONS>(m_vbe_outputs, vbe_data,
-                                         m_bn_vbe_w1.data(), m_bn_vbe_w2.data());
-            const auto vbe_channels =
-                innerproduct<true>(vbe_data, m_ip1_vbe_w, m_ip1_vbe_b);
-            const auto vbe_output =
-                innerproduct<false>(vbe_channels, m_ip2_vbe_w, m_ip2_vbe_b);
-
-            result.beta = vbe_output[0];
-        } else if (m_value_head_type==DOUBLE_Y) {
+        if (m_value_head_type==DOUBLE_Y) {
             const auto vbe_channels =
                 innerproduct<true>(val_data, m_ip1_vbe_w, m_ip1_vbe_b);
             const auto vbe_output =
                 innerproduct<false>(vbe_channels, m_ip2_vbe_w, m_ip2_vbe_b);
 
             result.beta = vbe_output[0];
+            if (m_vbe_head_rets == 2) {
+                result.beta2 = vbe_output[1];
+            }
         } else if (m_value_head_type==DOUBLE_T) {
             const auto vbe_output =
                 innerproduct<false>(val_channels, m_ip2_vbe_w, m_ip2_vbe_b);
             result.beta = vbe_output[0];
+            if (m_vbe_head_rets == 2) {
+                result.beta2 = vbe_output[1];
+            }
         } else if (m_value_head_type==DOUBLE_I) {
             result.beta = val_output[1];
+            if (m_vbe_head_rets == 2) {
+                result.beta2 = val_output[2];
+            }
         }
 
-        result.alpha = val_output[0];
-        result.beta = std::exp(result.beta + beta_nat_tune) * 10.0f / NUM_INTERSECTIONS;
+        if (!m_quartile_encoding) {
+            result.alpha = val_output[0];
+
+            // ln(x) = log2(x) * ln(2)
+            const auto beta_nat_tune = cfg_betatune * 0.69314718055994530941723212145818;
+
+            result.beta = std::exp(result.beta + beta_nat_tune) * 10.0 / NUM_INTERSECTIONS;
+            if (m_vbe_head_rets == 2) {
+                result.beta2 = std::exp(result.beta2 + beta_nat_tune) * 10.0 / NUM_INTERSECTIONS;
+            }
+        } else {
+            assert(m_vbe_head_rets == 1);
+
+            auto q1 = val_output[0];
+            const auto q2 = result.beta;
+            constexpr auto eps = 0.05;
+            constexpr auto log3 = 1.0986122886681096913952452369225;
+            result.alpha = 0.5 * ( q1 + q2 );
+            result.beta = 2.0 * log3 / ( eps + std::max(0.0f, q2 - q1) );
+        }
+
         result.is_sai = true;
-        const auto komi = state->get_komi_adj();
-        const auto white = (FastBoard::WHITE == state->get_to_move());
-        result.value = sigmoid(result.alpha, result.beta, white ? komi : -komi).first;
+        get_sai_winrate(result, state);
     }
 
     for (auto idx = size_t{0}; idx < NUM_INTERSECTIONS; idx++) {
@@ -1255,13 +1478,23 @@ void Network::show_heatmap(const FastState* const state,
         auto y = agent.quantile_mu;
         if (y<x) std::swap(x,y);
         myprintf("alpha: %5.2f    ", result.alpha);
-        myprintf("beta: %.2f     ", result.beta);
+        if (result.beta2 > 0) {
+            myprintf("betas: %.2f %.2f ", result.beta, result.beta2);
+        } else {
+            myprintf("beta: %.2f     ", result.beta);
+        }
         myprintf("winrate: %2.1f%%\n", result.value*100);
         myprintf("komi: %2.1f       ", state->get_komi());
         myprintf("handicap: %d    ", state->get_handicap());
+        if (result.beta2 > 0) {
+            myprintf("  ");
+        }
         myprintf("alpkt tree: %3.2f\n", agent.alpkt_tree);
         myprintf("lambda: %.2f    ", agent.lambda);
         myprintf("mu: %.2f       ", agent.mu);
+        if (result.beta2 > 0) {
+            myprintf("  ");
+        }
         myprintf("interval: [%.1f, %.1f]\n", x, y);
     } else {
         myprintf("value: %.1f%%\n", result.value*100);
@@ -1376,8 +1609,6 @@ std::vector<float> Network::gather_features(const GameState* const state,
                                             const bool chainlibs_features,
                                             const bool chainsize_features,
                                             const bool include_color) {
-    //    myprintf("gather_features() sym=%d, moves=%d, adv_f=%d, ch_lib_f=%d, incl_col=%d\n",
-    //             symmetry, input_moves, adv_features, chainlibs_features, include_color);
     assert(symmetry >= 0 && symmetry < NUM_SYMMETRIES);
 
     // if advanced board features are included, for every input move
@@ -1394,14 +1625,12 @@ std::vector<float> Network::gather_features(const GameState* const state,
                                        (adv_features ? 2 : 0) +
                                        (chainlibs_features ? CHAIN_LIBERTIES_PLANES : 0) +
                                        (chainsize_features ? CHAIN_SIZE_PLANES : 0));
-    //    myprintf("moves_planes=%d\n", moves_planes);
     const auto plane_block = input_moves * NUM_INTERSECTIONS;
 
     // if the color of the current player is included, two more input
     // planes are needed, otherwise one input plane filled with ones
     // will provide information on the border of the board for the CNN
     const auto input_planes = moves_planes + (include_color ? 2 : 1);
-    //    myprintf("input_planes=%d\n", input_planes);
 
     auto input_data = std::vector<float>(input_planes * NUM_INTERSECTIONS);
 
@@ -1417,10 +1646,6 @@ std::vector<float> Network::gather_features(const GameState* const state,
     const auto blacks_move = to_move == FastBoard::BLACK;
     const auto black_it = blacks_move ? current_it : opponent_it;
     const auto white_it = blacks_move ? opponent_it : current_it;
-    // myprintf("input moves: %d, advanced features: %d, include color: %d\n"
-    //       "moves planes: %d, input planes: %d, to move: %d, blacks_move: %d\n",
-    //       input_moves, adv_features, include_color,
-    //       moves_planes, input_planes, to_move, blacks_move);
 
     // we fill one plane with ones: this is the only one remaining
     // when the color of current player is not included, otherwise it
@@ -1518,6 +1743,8 @@ size_t Network::get_estimated_size() {
     // Value head
     result += m_fwd_weights->m_conv_val_w.size() * sizeof(float);
     result += m_fwd_weights->m_conv_val_b.size() * sizeof(float);
+    result += m_fwd_weights->m_conv_val_pool_w.size() * sizeof(float);
+    result += m_fwd_weights->m_conv_val_pool_b.size() * sizeof(float);
     result += m_val_outputs * sizeof(float); // m_bn_val_w1
     result += m_val_outputs * sizeof(float); // m_bn_val_w2
 

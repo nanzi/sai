@@ -225,10 +225,13 @@ template <typename net_t>
 void OpenCLScheduler<net_t>::push_convolve(unsigned int filter_size,
                                            unsigned int channels,
                                            unsigned int outputs,
-                                           const std::vector<float>& weights) {
+                                           const std::vector<float>& weights,
+                                           const std::vector<float>& means,
+                                           const std::vector<float>& variances,
+                                           enum Layer::LayerType layer_type) {
     for (const auto& opencl_net : m_networks) {
-        opencl_net->push_convolve(filter_size, channels, outputs,
-                                  from_float(weights));
+        opencl_net->push_convolve(filter_size, channels, outputs, from_float(weights),
+                                  from_float(means), from_float(variances), layer_type);
     }
 }
 
@@ -262,19 +265,32 @@ void OpenCLScheduler<net_t>::push_weights(
     }
 
     // Output head convolutions
-    push_convolve(1, outputs, weights->m_conv_pol_b.size(), weights->m_conv_pol_w);
-    push_convolve(1, outputs, weights->m_conv_val_b.size(), weights->m_conv_val_w);
-    if (weights->m_conv_vbe_b.size() > 0) {
-        push_convolve(1, outputs, weights->m_conv_vbe_b.size(), weights->m_conv_vbe_w);
+    // Value first
+    push_convolve(1, outputs, weights->m_conv_val_b.size(), weights->m_conv_val_w,
+                  weights->m_bn_val_w1, weights->m_bn_val_w2, Layer::VALUE_CONV);
+    if (weights->m_conv_val_pool_b.size()) {
+        push_convolve(1, weights->m_conv_val_b.size(), weights->m_conv_val_pool_b.size(),
+                      weights->m_conv_val_pool_w, weights->m_bn_val_pool_w1,
+                      weights->m_bn_val_pool_w2, Layer::VALUE_AVGPOOL);
+    }
+
+    // Then policy, as resconv layers requires two buffers at
+    // forward() and so input cannot be preserved without wasting
+    // memory
+    auto in_chans = outputs;
+    for (auto i = size_t{0}; i < weights->m_conv_pol_b.size(); i++) {
+        const auto out_chans = weights->m_conv_pol_b[i].size();
+        push_convolve(1, in_chans, out_chans, weights->m_conv_pol_w[i],
+                      weights->m_bn_pol_w1[i], weights->m_bn_pol_w2[i], Layer::POL_CONV);
+        in_chans = out_chans;
     }
 }
 
 template <typename net_t>
 void OpenCLScheduler<net_t>::forward(const std::vector<float>& input,
                                      std::vector<float>& output_pol,
-                                     std::vector<float>& output_val,
-                                     std::vector<float>& output_vbe) {
-    auto entry = std::make_shared<ForwardQueueEntry>(input, output_pol, output_val, output_vbe);
+                                     std::vector<float>& output_val) {
+    auto entry = std::make_shared<ForwardQueueEntry>(input, output_pol, output_val);
     std::unique_lock<std::mutex> lk(entry->mutex);
     {
         std::unique_lock<std::mutex> lk(m_mutex);
@@ -365,7 +381,6 @@ void OpenCLScheduler<net_t>::batch_worker(const size_t gnum) {
     auto batch_input = std::vector<float>();
     auto batch_output_pol = std::vector<float>();
     auto batch_output_val = std::vector<float>();
-    auto batch_output_vbe = std::vector<float>();
 
     while (true) {
         auto inputs = pickup_task();
@@ -374,15 +389,13 @@ void OpenCLScheduler<net_t>::batch_worker(const size_t gnum) {
     size_t input_planes;
     size_t policy_outputs;
     size_t val_outputs;
-    size_t vbe_outputs;
 
-    std::tie(input_planes, policy_outputs, val_outputs, vbe_outputs)
+    std::tie(input_planes, policy_outputs, val_outputs)
         = m_networks[gnum]->get_output_sizes();
 
     const auto in_size = input_planes * NUM_INTERSECTIONS;
     const auto out_pol_size = policy_outputs * NUM_INTERSECTIONS;
     const auto out_val_size = val_outputs * NUM_INTERSECTIONS;
-    const auto out_vbe_size = vbe_outputs * NUM_INTERSECTIONS;
 
         if (!m_running) {
             return;
@@ -400,7 +413,6 @@ void OpenCLScheduler<net_t>::batch_worker(const size_t gnum) {
         batch_input.resize(in_size * count);
         batch_output_pol.resize(out_pol_size * count);
         batch_output_val.resize(out_val_size * count);
-        batch_output_vbe.resize(out_vbe_size * count);
 
         auto index = size_t{0};
         for (auto& x : inputs) {
@@ -411,7 +423,7 @@ void OpenCLScheduler<net_t>::batch_worker(const size_t gnum) {
 
         // run the NN evaluation
         m_networks[gnum]->forward(
-            batch_input, batch_output_pol, batch_output_val, batch_output_vbe, context, count);
+            batch_input, batch_output_pol, batch_output_val, context, count);
 
         // Get output and copy back
         index = 0;
@@ -422,11 +434,6 @@ void OpenCLScheduler<net_t>::batch_worker(const size_t gnum) {
             std::copy(begin(batch_output_val) + out_val_size * index,
                       begin(batch_output_val) + out_val_size * (index + 1),
                       begin(x->out_va));
-            if (out_vbe_size > 0) {
-                std::copy(begin(batch_output_vbe) + out_vbe_size * index,
-                          begin(batch_output_vbe) + out_vbe_size * (index + 1),
-                          begin(x->out_vb));
-            }
             x->cv.notify_all();
             index++;
         }

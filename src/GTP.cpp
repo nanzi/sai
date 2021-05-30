@@ -1052,7 +1052,8 @@ void GTP::execute(GameState & game, const std::string& xinput) {
         cmdstream >> symmetry;
 
         Network::Netresult vec;
-        search->prepare_root_node();
+
+        // search->prepare_root_node();
         if (cmdstream.fail()) {
             // Default = DIRECT with no symmetric change
             vec = s_network->get_output(
