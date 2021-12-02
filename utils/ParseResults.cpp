@@ -25,7 +25,7 @@ struct sainet {
     bool is_valid() const noexcept { return !hash.empty() && cumul >= 0.0; }
     bool has_rating() const noexcept { return rating >= 0.0f; }
 
-    friend inline bool operator<(const sainet & net1, const sainet & net2) noexcept{
+    friend inline bool operator<(const sainet & net1, const sainet & net2) noexcept {
         return net1.cumul < net2.cumul;
     }
 };
@@ -51,13 +51,11 @@ struct match {
             && num >= h1wins + h2wins;
     }
 
-#if 0
     void flip() noexcept {
         swap(hash1,  hash2);
         swap(idx1,   idx2);
         swap(h1wins, h2wins);
     }
-#endif
 };
 
 struct net_status{
@@ -121,7 +119,7 @@ inline tags tag_type(const string & tag)
     return it == end(known_tags) ? NA : static_cast<tags>( distance(begin(known_tags), it) );
 }
 
-void get_first_line(ifstream& data, string& s, const int header_lines = 4) {
+void get_first_line(ifstream & data, string & s, const int header_lines = 4) {
     auto j = 0;
     auto position = data.tellg();
     do {
@@ -137,12 +135,12 @@ void get_first_line(ifstream& data, string& s, const int header_lines = 4) {
     }
 }
 
-inline bool quote_opened (const string &s) {
+inline bool quote_opened(const string & s) noexcept {
     const auto n = std::count(s.begin(), s.end(), '"');
     return n % 2;
 }
 
-inline void complete_quote (ifstream &netsdata, string &s) {
+inline void complete_quote(ifstream & netsdata, string & s) {
     string tmp;
     while (netsdata >> tmp) {
         s.append(tmp);
@@ -151,7 +149,7 @@ inline void complete_quote (ifstream &netsdata, string &s) {
     }
 }
 
-inline int get_index(const vector<sainet> & nets, string hash) {
+inline int get_index(const vector<sainet> & nets, const string & hash) noexcept {
     for (auto & j : nets) {
         if (j.hash == hash) {
             return j.index;
@@ -160,7 +158,7 @@ inline int get_index(const vector<sainet> & nets, string hash) {
     return -1;
 }
 
-void sort_and_set_indices(vector<sainet> & nets, matches_t & matches) {
+void sort_and_set_indices(vector<sainet> & nets, matches_t & matches) noexcept {
     // sort by cumul
     stable_sort(begin(nets), end(nets));
 
@@ -181,19 +179,24 @@ void sort_and_set_indices(vector<sainet> & nets, matches_t & matches) {
 }
 
 #ifndef NDEBUG
-bool check_indices(const vector<sainet> & nets) {
+inline bool check_indices(const vector<sainet> & nets) noexcept {
     if (!is_sorted(begin(nets), end(nets)))
         return false;
 
     int i = 0;
     for (auto & net : nets) {
-        if( net.index != i++ )
+        if (net.index != i++)
             return false;
     }
 
     return true;
 }
 #endif
+
+inline size_t count_rated_nets(const nets_t & nets) noexcept {
+    return count_if( begin(nets), end(nets),
+                     mem_fn(&sainet::has_rating) );
+}
 
 } // end namespace
 
@@ -351,7 +354,7 @@ nets_t load_netsdata(const string & filename) {
     return nets;
 }
 
-matches_t load_matchdata(string filename) {
+matches_t load_matchdata(const string & filename) {
     ifstream matchdata;
 
     matchdata.open(filename);
@@ -556,7 +559,7 @@ void create_connected_graph_from_hook(nets_t & nets, matches_t & matches, const 
     sort_and_set_indices(nets, matches);
 }
 
-float delta_rating(float prior_elo_std, float wins, float jigos, float losses) {
+static inline float delta_rating(const float prior_elo_std, const float wins, const float jigos, const float losses) {
     assert(( (void)"Invalid match", (wins >= 0.0f && jigos >= 0.0f && losses >= 0.0f) ));
 
     constexpr float ELO_FACTOR = 400.0f / log(10.0f);
@@ -569,21 +572,27 @@ float delta_rating(float prior_elo_std, float wins, float jigos, float losses) {
     const float T = powf(prior_elo_std / ELO_FACTOR, 2.0f);
 
     const float score = 0.5f + 0.5f * (wins - losses)
-        / (num + 4.0f * (wins + losses) / num / T );
+        / (num + 4.0f * (wins + losses) / num / T);
 
     return ELO_FACTOR * (log(score) - log(1.0f-score));
 }
 
-void load_existing_ratings(string filename, nets_t & nets)
-{
+void load_existing_ratings(const string & filename, nets_t & nets, const string & hook) {
     assert(( (void)"Indices must be set", check_indices(nets) ));
 
     ifstream ratingsfile;
 
     ratingsfile.open(filename);
     if (!ratingsfile){
-        cerr << "No previous ratings file " << filename << " found." << endl;
-        exit(1);
+        cerr << "No previous ratings file " << filename
+             << " found: creating new ratings by giving Elo 0.0 to hook." << endl;
+
+        auto index = get_index(nets, hook);
+        assert((index != -1));
+
+        nets[index].rating = 0.0;
+
+        return;
     }
 
     cerr << "File " << filename << " opened...\n";
@@ -591,9 +600,9 @@ void load_existing_ratings(string filename, nets_t & nets)
     size_t count = 0;
     string s;
     while (ratingsfile >> s) {
-        const auto hash = s.substr(0,64);
+        const auto hash = s.substr(0, 64);
         auto commapos = s.find(',');
-        for (auto i=0 ; i<7 && commapos!=string::npos ; ++i) {
+        for (auto i = 0; i < 7 && commapos != string::npos; ++i) {
             commapos = s.find(',', commapos + 1);
         }
         if (commapos == string::npos) {
@@ -606,7 +615,7 @@ void load_existing_ratings(string filename, nets_t & nets)
         ++count;
 
         auto index = get_index(nets, hash);
-        if( index == -1 )
+        if (index == -1)
             continue;
 
         nets[index].rating = rating;
@@ -618,45 +627,72 @@ void load_existing_ratings(string filename, nets_t & nets)
          << " nets with previous rating values\n";
 }
 
+
+
 void rate_connected_nets(nets_t & nets, const matches_t & matches, float prior_elo_std) {
     assert(( (void)"Indices must be set", check_indices(nets) ));
 
+    vector<float> sum_ratings(nets.size(), 0.0f);
+    vector<float> sum_games(nets.size(), 0.0f);
+
+    
     // get a rough estimate of the missing ratings
-    for (auto & net : nets) {
+    size_t num_rated_nets = count_rated_nets(nets);
+    if (num_rated_nets == 0) {
+        cerr << "Hook network must have a rating" << endl;
+        exit(1);
+    }
 
-        if (net.has_rating())
-            continue;
+    size_t num_new_ratings = 0;
+    for( size_t prev_num = 0;
+         prev_num != num_rated_nets && nets.size() != num_rated_nets; ) { // stop the loop once no new ratings have been assigned
 
-        float sum_ratings = 0.0f;
-        size_t sum_games = 0;
+        cerr << "* ";
 
-        const auto update_sums = [&sum_ratings, &sum_games, &prior_elo_std]
-            (const match & m, const sainet & opp, float sign){
+        // loop on all matches in order to update as many ratings as possible
+        for (auto match : matches) {
 
-            if( !opp.has_rating() )
-                return;
+            if (nets[match.idx1].has_rating() == nets[match.idx2].has_rating())
+                continue; // if both or none of the 2 nets has a rating nothing to do here
 
-            const float delta = delta_rating(prior_elo_std,
-                                             m.h1wins, m.jigos(), m.h2wins);
+            if (!nets[match.idx2].has_rating())
+                match.flip(); // ensure net 1 is unrated and net 2 is rated
+            assert(( nets[match.idx2].has_rating() ));
+            
+            const float num_games = match.num;
+            const float delta = delta_rating(prior_elo_std, match.h1wins,
+                                             match.jigos(), match.h2wins);
 
-            sum_ratings += float(m.num) * max(0.0f, opp.rating + sign * delta);
-            sum_games += m.num;
-        };
-
-        for (auto & match : matches) {
-            if (net.index == match.idx1)
-                update_sums(match, nets[match.idx2],  1.0f);
-            else if(net.index == match.idx2)
-                update_sums(match, nets[match.idx1], -1.0f);
+            sum_ratings[match.idx1] += num_games
+                * max(0.0f, nets[match.idx2].rating + delta);
+            
+            sum_games[match.idx1] += num_games;
         }
 
-        if (sum_games == 0) {
-            cerr << "Something's wrong. Net " << net.hash.substr(0,8)
-                 << " has no rating, and no connections were found." << endl;
-            exit(1);
+        // assign a rating to those nets that can have one
+        for (auto & net : nets) {
+            if (net.has_rating() || sum_games[net.index] == 0)
+                continue; // nothing to update
+            
+            net.rating = sum_ratings[net.index] / sum_games[net.index];
+            ++num_new_ratings;
         }
 
-        net.rating = sum_ratings / float(sum_games);
+        prev_num = num_rated_nets;
+        num_rated_nets = count_rated_nets(nets);
+    }
+
+    cerr << "Added " << num_new_ratings << " ratings via simplified Elo\n";
+    
+    if (num_rated_nets != nets.size()) {
+
+        cerr << "Something's wrong. " << num_rated_nets << " nets:\n";
+        for (const auto & net : nets) {
+            if (!net.has_rating())
+                cerr << net.hash.substr(0,8) << "  ";
+        }
+        cerr << "\nhave no ratings, and no connecting matches were found." << endl;
+        exit(1);
     }
 }
 
@@ -908,7 +944,7 @@ int main(int argc, char* argv[]) {
     cerr << "Nets linked to hook: " << nets.size() << "\n";
     cerr << "Hook position: " << get_index(nets, hook_net_hash) << "\n";
 
-    load_existing_ratings(saiXX + "-ratings.csv", nets);
+    load_existing_ratings(saiXX + "-ratings.csv", nets, hook_net_hash);
     rate_connected_nets(nets, matches, prior_elo_std);
 
     write_netlist(saiXX + "-rated-nets.csv", nets);
