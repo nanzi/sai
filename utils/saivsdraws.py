@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
-import tensorflow as tf
+import tensorflow.compat.v1 as tf
+tf.disable_v2_behavior()
+# import tensorflow as tf
 import numpy as np
 import csv
 import sys
@@ -75,10 +77,12 @@ def build_process(hook_pos: int):
     s0 = tf.constant(initial_ratings[0:hook_pos+1], shape=[hook_pos+1,1], dtype=tf.float32)
     # fixed part of the s vector, with rating of all nets up to hook_pos being set to previous run results
 
-    s_scale = tf.Variable(1.0, dtype=tf.float32)
-
     s = tf.concat([s0, s_vbl], 0) # n*1 (column) vector with ratings
-    s = tf.math.scalar_mul(s_scale, s)
+
+    if hook_pos == 0:
+        # add a scale factor to help convergence especially when run without previous results
+        s_scale = tf.Variable(1.0, dtype=tf.float32)
+        s = tf.math.scalar_mul(s_scale, s)
 
     ones = tf.constant(1.0, shape=[1, n], dtype = tf.float32) # row vector with ones
     
@@ -158,22 +162,23 @@ def build_process(hook_pos: int):
         stable = 0
         max_ll = 1
         for i in list(range(epochs)):
-            #            print(sess.run(s))
-            #            print(sess.run(root))
-            #            print(sess.run(tf.gradients(tf.reduce_sum(root), s)))
+            # print(sess.run(s))
+            # print(sess.run(root))
+            # print(sess.run(tf.gradients(tf.reduce_sum(root), s)))
             sess.run(optimizer)
-            #            print(sess.run(s))
+            # print(sess.run(s))
             this_ll = sess.run(avg_ll)
             this_excess = sess.run(excess)
             if max_ll > 0 or this_ll > max_ll:
                 max_ll = this_ll
                 stable = 0
                 best_s = sess.run(s)
+                # print(best_s)
             else:
                 stable += 1
             
             if i % 20 == 0:
-#                print(i, this_ll, stable)
+                # print(i, this_ll, stable)
                 print(i, -this_ll, this_excess, stable)
             if stable > 1000:
                 break
