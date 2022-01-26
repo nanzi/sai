@@ -53,6 +53,12 @@
 
 using namespace Utils;
 
+static constexpr auto LOG2_NUM_ITEMS_PER_WG   = 8;
+static constexpr auto LOG2_NUM_CHANS_PER_WG   = 5;
+static constexpr auto LOG2_NUM_OUTPUTS_PER_WG = 4;
+static constexpr auto LOG2_NUM_MULTS_PER_ITEM = 5;
+
+
 template <typename net_t> static std::string getClArgs();
 
 template <> std::string getClArgs<float>() {
@@ -80,7 +86,8 @@ static const std::string sourceCode_config = R"(
 "\n#define NUM_INTERSECTIONS " + std::to_string(NUM_INTERSECTIONS) +
 "\n#define WINOGRAD_M " + std::to_string(WINOGRAD_M) +
 "\n#define WINOGRAD_ALPHA " + std::to_string(WINOGRAD_ALPHA) +
-"\n#define WTILES " + std::to_string(WINOGRAD_WTILES);
+"\n#define WTILES " + std::to_string(WINOGRAD_WTILES) +
+"\n#define LOG2_NUM_MULTS_PER_ITEM " + std::to_string(LOG2_NUM_MULTS_PER_ITEM);
 
 static const std::string sourceCode_convolve1 =
     #include "kernels/convolve1.opencl"
@@ -107,8 +114,8 @@ void OpenCL<net_t>::ensure_context_initialized(OpenCLContext &opencl_context) {
         // Make kernels
         opencl_context.m_convolve1_kernel =
             cl::Kernel(m_program, "convolve1");
-        opencl_context.m_merge_kernel =
-            cl::Kernel(m_program, "merge");
+        // opencl_context.m_merge_kernel =
+        //     cl::Kernel(m_program, "merge");
         opencl_context.m_in_transform_kernel =
             cl::Kernel(m_program, "in_transform");
         opencl_context.m_sgemm_kernel =
@@ -168,17 +175,17 @@ void OpenCL_Network<net_t>::forward(const std::vector<float>& input,
     m_opencl.ensure_context_initialized(opencl_context);
 
     if (!opencl_context.m_buffers_allocated) {
+        using std::max;
         auto max_channels = unsigned{0};
         auto conv1_merge_size = unsigned{0};
         for (const auto& layer : m_layers) {
-            max_channels = std::max(max_channels,
-                                    std::max(layer.channels, layer.outputs));
+            max_channels = max(max_channels,
+                               max(layer.channels, layer.outputs));
             if (layer.type == Layer::POL_CONV ||
                 layer.type == Layer::VALUE_CONV ||
                 layer.type == Layer::VALUE_AVGPOOL) {
-                constexpr int channelShift = 3;
-                conv1_merge_size = std::max(conv1_merge_size,
-                                            (layer.channels >> channelShift) * layer.outputs);
+                conv1_merge_size = max(conv1_merge_size,
+                                       max(1U, layer.channels >> LOG2_NUM_CHANS_PER_WG) * layer.outputs);
             }
         }
 
@@ -563,83 +570,131 @@ void OpenCL_Network<net_t>::convolve3(OpenCLContext & opencl_context,
     }
 }
 
-template <typename net_t>
-void OpenCL_Network<net_t>::convolve1(OpenCLContext & opencl_context,
-                              int channels, int outputs,
-                              cl::Buffer& bufferInput,
-                              cl::Buffer& bufferOutput,
-                              cl::Buffer& bufferMerge,
-                              weight_slice_t weights,
-                              weight_slice_t bn_weights,
-                              int batch_size,
-                              bool add_origin) {
-    // The size of the board is defined at compile time
-    constexpr int width = BOARD_SIZE;
-    constexpr int boardsize = NUM_INTERSECTIONS;
-    constexpr int rowTiles = BOARD_SIZE;
-
-    // Input channel grouping in multiples of 8
-    constexpr int channelGroup = 8;
-    constexpr int channelShift = 3;
-    constexpr int rowGroup = 1;
-    size_t outputGroup = std::min(outputs, 32);
-
-    auto m_convolve_kernel = &opencl_context.m_convolve1_kernel;
-
-#ifndef NDEBUG
-    // Total output size after reducing
-    size_t outSize = boardsize * outputs * sizeof(net_t);
-
-    // Produce channel * output planes and merge them at the end
-    size_t mergeSize = (channels >> channelShift) * outSize;
-    assert(mergeSize <= bufferMerge.getInfo<CL_MEM_SIZE>());
+#if !defined(NDEBUG) && 0
+#define PRINT_CONV1_NDRANGE_SIZES
 #endif
 
-    // Copy the rows locally
-    size_t stripSize = width * sizeof(float);
+namespace
+{
+    constexpr inline int ceil_pow2(const int v) noexcept
+    {
+        assert(v > 0);
+        const unsigned v_ = v; // avoids comparing signed vs unsigned
+        unsigned ret = 1;
+        while(v_ > ret) ret <<= 1;
+        return ret;
+    }
+}
 
-    int rowBuffer = std::min<int>(channelGroup, 7);
-    size_t rowSize = channelGroup * outputGroup * rowBuffer * sizeof(float);
+template <typename net_t>
+void OpenCL_Network<net_t>::convolve1(OpenCLContext & opencl_context,
+                                      const int channels,
+                                      const int outputs,
+                                      cl::Buffer& bufferInput,
+                                      cl::Buffer& bufferOutput,
+                                      cl::Buffer& /*bufferMerge*/,
+                                      weight_slice_t weights,
+                                      weight_slice_t bn_weights,
+                                      const int batch_size,
+                                      const bool add_origin) {
+    // The size of the board is defined at compile time
+    constexpr int num_items_wg   = 1 << LOG2_NUM_ITEMS_PER_WG;   // m - number of items per workgroup
+    constexpr int num_chans_wg   = 1 << LOG2_NUM_CHANS_PER_WG;   //   - number of channels handled per workgroup
+    constexpr int num_outputs_wg = 1 << LOG2_NUM_OUTPUTS_PER_WG;
+    constexpr int num_mults_item = 1 << LOG2_NUM_MULTS_PER_ITEM; // d - number of multiplications per item
+
+    const int sites              = NUM_INTERSECTIONS * batch_size;  // n - number of sites
+
+    const int num_items_a_c      = std::max(1, channels / num_mults_item); // number of items along channels
+    
+    // if a loc_outputs of 8 would result in a waste of items of 25%, use 2
+    const bool is_wasting_items  = outputs <= 4 * (num_outputs_wg - 1 - ((outputs - 1) % num_outputs_wg));
+    const int loc_outputs        = num_outputs_wg / (is_wasting_items ? 4 : 1); // beta
+
+    // gamma = min(32 * eccent, ceil_pow2(num_items_a_c) * 8) - in any case a power of 2!
+    const int loc_channels       = std::min(num_chans_wg * (is_wasting_items ? 2 : 1),
+                                            ceil_pow2(num_items_a_c) * num_mults_item);
+
+    // local number of items along channels
+    const int loc_num_items_a_c  = loc_channels / num_mults_item;
+    // alpha - this is always an exact division
+    const int loc_sites          = num_items_wg / loc_num_items_a_c / loc_outputs;
+
+    // const int merge_size_a_c     = ceilMultiple(channels, loc_channels) / loc_channels;
+
+    const cl_int4 conv1_sizes{sites, outputs, channels, 0};
+
+    cl::Kernel & m_convolve_kernel = opencl_context.m_convolve1_kernel;
+
+#ifdef PRINT_CONV1_NDRANGE_SIZES
+    myprintf("Buffer sizes: In=%d, Out=%d\n",
+             bufferInput.getInfo<CL_MEM_SIZE>(), bufferOutput.getInfo<CL_MEM_SIZE>());
+#endif
 
     cl::CommandQueue & queue = opencl_context.m_commandqueue;
 
     try {
-        m_convolve_kernel->setArg(0, bufferInput);
-        m_convolve_kernel->setArg(1, bufferMerge);
-        m_convolve_kernel->setArg(2, weights[0]);
-        m_convolve_kernel->setArg(3, cl::Local(stripSize * channelGroup * rowGroup));
-        m_convolve_kernel->setArg(4, cl::Local(rowSize));
-
+        m_convolve_kernel.setArg(0, bufferInput);
+        m_convolve_kernel.setArg(1, bufferOutput);
+        m_convolve_kernel.setArg(2, weights[0]);
+        m_convolve_kernel.setArg(3, bn_weights[0]);
+        m_convolve_kernel.setArg(4, bn_weights[1]);
+        m_convolve_kernel.setArg(5, cl::Local(loc_sites * loc_channels * sizeof(float)));
+        m_convolve_kernel.setArg(6, cl::Local(loc_outputs * loc_channels * sizeof(float)));
+        m_convolve_kernel.setArg(7, cl::Local(num_items_wg * sizeof(float)));
+        m_convolve_kernel.setArg(8, conv1_sizes);
+        m_convolve_kernel.setArg(9, int(add_origin));
+        
+#ifdef PRINT_CONV1_NDRANGE_SIZES
+        myprintf("%d %d %d\n", sites, outputs, channels);
+        myprintf("%d %d %d\n", ceilMultiple(sites,         loc_sites),
+                               ceilMultiple(outputs,       loc_outputs),
+                               loc_num_items_a_c);
+        myprintf("%d %d %d\n", loc_sites, loc_outputs, loc_num_items_a_c);
+#endif
         queue.enqueueNDRangeKernel(
-            *m_convolve_kernel, cl::NullRange,
-            cl::NDRange(channels, outputs, batch_size * rowTiles),
-            cl::NDRange(channelGroup, outputGroup, rowGroup));
+            m_convolve_kernel, cl::NullRange,
+            cl::NDRange(ceilMultiple(sites,         loc_sites),
+                        ceilMultiple(outputs,       loc_outputs),
+                        loc_num_items_a_c),
+            cl::NDRange(loc_sites, loc_outputs, loc_num_items_a_c));
     } catch (const cl::Error &e) {
         std::cerr << "Error in convolve1: " << e.what() << ": "
                   << e.err() << std::endl;
         throw;
     }
 
+#if 0
     cl::Kernel & merge_kernel = opencl_context.m_merge_kernel;
-    assert(channels % (1 << channelShift) == 0);
+
+    const int loc_merge_outputs = (outputs >= 8 && outputs % 4 == 0) ? 4 : 1;
+    const int loc_merge_sites   = num_items_wg / loc_merge_outputs;
+        
+    const cl_int4 merge_sizes{sites, outputs, 1, merge_size_a_c};
 
     try {
         merge_kernel.setArg(0, bn_weights[0]);
         merge_kernel.setArg(1, bn_weights[1]);
         merge_kernel.setArg(2, bufferMerge);
         merge_kernel.setArg(3, bufferOutput);
-        merge_kernel.setArg(4, channels >> channelShift);
-        merge_kernel.setArg(5, int(add_origin));
+        merge_kernel.setArg(4, cl::Local(2 * loc_merge_outputs * sizeof(float)));
+        merge_kernel.setArg(5, merge_sizes);
+        merge_kernel.setArg(6, int(add_origin));
 
-        queue.enqueueNDRangeKernel(
-            merge_kernel, cl::NullRange,
-            cl::NDRange(outputs, boardsize, batch_size),
-            cl::NDRange(std::min(8, outputs), BOARD_SIZE, 1));
+#ifdef PRINT_CONV1_NDRANGE_SIZES
+        myprintf("%d %d %d\n", sites, outputs, merge_size_a_c);
+        myprintf("%d %d\n", ceilMultiple(sites, loc_merge_sites), outputs);
+        myprintf("%d %d\n", loc_merge_sites, loc_merge_outputs);
+#endif
+        queue.enqueueNDRangeKernel(merge_kernel, cl::NullRange,
+            cl::NDRange(ceilMultiple(sites, loc_merge_sites), outputs, 1),
+            cl::NDRange(loc_merge_sites, loc_merge_outputs, 1));
     } catch (const cl::Error &e) {
         std::cerr << "Error in merge: " << e.what() << ": "
                   << e.err() << std::endl;
         throw;
     }
+#endif
 }
 
 template<class T>
@@ -995,6 +1050,7 @@ void OpenCL<net_t>::initialize(const int channels, size_t batch_size) {
         myprintf("%d ", d);
     }
     myprintf("\n");
+    myprintf("Local memory per workgroup: %d\n", m_device.getInfo<CL_DEVICE_LOCAL_MEM_SIZE>());
 
     m_init_ok = true;
 }

@@ -277,13 +277,6 @@ float Utils::median(std::vector<float> & sample){
     } else {
         result = 0.5 * sample[len/2] + 0.5 * sample[len/2-1];
     }
-#ifndef NDEBUG
-    myprintf("Median over %d values.\n", len);
-    for (auto& x : sample) {
-        myprintf("%.1f ", x);
-    }
-    myprintf("\nResult is: %.1f\n", result);
-#endif
     return result;
 }
 

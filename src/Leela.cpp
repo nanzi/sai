@@ -119,23 +119,22 @@ static void calculate_thread_count_gpu(boost::program_options::variables_map & v
     } else {
         if (vm["batchsize"].as<unsigned int>() > 0) {
             cfg_batch_size = vm["batchsize"].as<unsigned int>();
+            cfg_num_threads = std::min(cfg_max_threads, cfg_batch_size * gpu_count * 2);
         } else {
+#ifdef NDEBUG
             cfg_batch_size = 5;
+            cfg_num_threads = std::min(cfg_max_threads, cfg_batch_size * gpu_count * 2);
+#else
+            cfg_batch_size  = 1;
+            cfg_num_threads = 1;
+#endif
         }
-
-        cfg_num_threads = std::min(cfg_max_threads, cfg_batch_size * gpu_count * 2);
     }
 
-#ifndef NDEBUG
-    cfg_num_threads = 1;
-    cfg_batch_size = 1;
-#endif
     if (cfg_num_threads < cfg_batch_size) {
         printf("Number of threads = %d must be no smaller than batch size = %d\n", cfg_num_threads, cfg_batch_size);
         exit(EXIT_FAILURE);
     }
-
-
 }
 #endif
 

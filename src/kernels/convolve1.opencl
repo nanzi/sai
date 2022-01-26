@@ -31,118 +31,222 @@
 // literal). Comment-out this line for syntax-highlighting when developing.
 R"(
     __kernel
-    __attribute__((work_group_size_hint(8, 16, 1)))
+    __attribute__((work_group_size_hint(8, 8, 4)))
     void convolve1(
                    __global const net_t * restrict in,
-                   __global net_t * restrict merge,
+                   __global net_t * restrict out,
                    __global const net_t * restrict weights,
+                   __global const net_t * restrict means,
+                   __global const net_t * restrict stdevs,
                    __local real * channel_buff,
-                   __local real * row_buff) {
+                   __local real * filter_buff,
+                   __local real * merge_buff,
+                   __private const int4 sizes,
+                   __private const int add_origin) {
 
-        // cl::NDRange global(channels, outputs, row);
-        const int c   = get_global_id(0);  // channel
-        const int o   = get_global_id(1);  // output
-        const int row_batch = get_global_id(2);  // row * batch_size
+        // cl::NDRange global(ceilMultiple(sites,         loc_sites),
+        //                    ceilMultiple(outputs,       loc_outputs),
+        //                    ceilMultiple(num_items_a_c, loc_num_items_a_c)),
+        // cl::NDRange local(loc_sites, loc_outputs, loc_num_items_a_c);
 
-        const int row = row_batch % BOARD_SIZE;
-        const int batch = row_batch / BOARD_SIZE;
+        const int num_mults_item = 1 << LOG2_NUM_MULTS_PER_ITEM;
 
-        const int channels = get_global_size(0);
-        const int outputs  = get_global_size(1);
+        const int s  = get_global_id(0);  // site    [0, sites - 1]
+        const int o  = get_global_id(1);  // output  [0, outputs - 1]
+        
+        const int inter = s % NUM_INTERSECTIONS;
+        const int batch = s / NUM_INTERSECTIONS;
 
-        const int input_offset = batch * NUM_INTERSECTIONS * channels;
-        const int merge_offset = batch * NUM_INTERSECTIONS * (channels >> 3) * outputs;
+        const int sites         = sizes.s0; // sites == (get_global_size(0) / NUM_INTERSECTIONS) * NUM_INTERSECTIONS
+        const int outputs       = sizes.s1;
+        // const int num_items_a_c = get_global_size(2);
+        const int channels      = sizes.s2; // channels <= num_items_a_c << LOG2_NUM_MULTS_PER_ITEM
 
-        // cl::NDRange local(2, (1->32), 1);
-        const int lx = get_local_id(0);
-        const int ly = get_local_id(1);
-        const int chan_buff_size = 8;
-        const int out_buff_size  = get_local_size(1);
-        const int row_buff_size  = 7;
-        const int chan_shift     = 3;
-        // input = channels * height * width
-        // output = outputs * height * width
-        // weights = output * channels * filter
-        // merge = channels * outputs * height * width
-        const int width = BOARD_SIZE;
-        const int height = BOARD_SIZE;
-        const int strip_size = width;
-        // Copy the input channels (strips) locally
-        if (out_buff_size < BOARD_SIZE && ly == 0) {
-            // strip-row
-            for (int w = 0; w < width; w++) {
-                channel_buff[lx * width + w] =
-                    vload_net_t((c * height + row) * width + w + input_offset, in);
-            }
-        } else if (out_buff_size >= BOARD_SIZE && ly < BOARD_SIZE) {
-            // Every thread copies a column
-            channel_buff[lx * width + ly] = vload_net_t((c * height + row) * width +
-                ly + input_offset, in);
-        }
-        // Copy the filter we are applying locally
-        __private real filter_buff = vload_net_t((o * channels + c), weights);
-        barrier(CLK_LOCAL_MEM_FENCE);
-        int out_lane = 0;
-        int out_cw   = 0;
-        #pragma unroll
-        for (int cw = 0; cw < width; cw++) {
-            int fid = lx * strip_size;
-            real out  = channel_buff[fid + cw] * filter_buff;
-            row_buff[(ly * chan_buff_size + lx) * row_buff_size + out_lane] = out;
-            out_lane++;
-            // Row buffer full or last lane?
-            if (out_lane == row_buff_size || (cw == width - 1)) {
-                barrier(CLK_LOCAL_MEM_FENCE);
-                if (lx < out_lane) {
-                    real val;
-                    val  = row_buff[(ly * chan_buff_size + 0) * row_buff_size + lx];
-                    val += row_buff[(ly * chan_buff_size + 1) * row_buff_size + lx];
-                    val += row_buff[(ly * chan_buff_size + 2) * row_buff_size + lx];
-                    val += row_buff[(ly * chan_buff_size + 3) * row_buff_size + lx];
-                    val += row_buff[(ly * chan_buff_size + 4) * row_buff_size + lx];
-                    val += row_buff[(ly * chan_buff_size + 5) * row_buff_size + lx];
-                    val += row_buff[(ly * chan_buff_size + 6) * row_buff_size + lx];
-                    val += row_buff[(ly * chan_buff_size + 7) * row_buff_size + lx];
-                    vstore_net_t(val, (((c >> chan_shift) * height + row) * width +
-                        out_cw + lx) * outputs + o + merge_offset, merge);
+        const int ls  = get_local_id(0);
+        const int lo  = get_local_id(1);
+        const int lci = get_local_id(2);
+        const int lc  = lci << LOG2_NUM_MULTS_PER_ITEM;
+
+        const int loc_sites          = get_local_size(0);
+        const int loc_outputs        = get_local_size(1);
+        const int loc_num_items_a_c  = get_local_size(2);
+        const int loc_channels       = loc_num_items_a_c << LOG2_NUM_MULTS_PER_ITEM;
+        const int numTiles           = 1 + (channels-1) / loc_channels; // ceil(channels / loc_channels)
+
+        real val = 0;
+        for (int t=0 ; t<numTiles ; t++) {
+            const int ci = t * loc_num_items_a_c + lci;
+            const int c  = ci << LOG2_NUM_MULTS_PER_ITEM;
+
+            // Copy the input locally
+            if (s < sites) {
+                if (num_mults_item <= loc_outputs) {
+                    // Values of 'lo' are enough to copy the input data one location per item
+                    const int indexChannel = lc + lo;
+                    const int globalChannel = c + lo;
+                    if (lo < num_mults_item && globalChannel < channels) {
+                        channel_buff[indexChannel * loc_sites + ls]
+                            = vload_net_t((batch * channels + globalChannel) * NUM_INTERSECTIONS + inter, in);
+                    }
+                } else {
+                    // Values of 'lo' are not enough: each item will copy the same share of input values
+                    const int ratio = num_mults_item / loc_outputs; // always a power of 2
+#pragma unroll
+                    for (int i = 0; i < ratio; ++i) {
+                        const int indexChannel = lc + lo * ratio + i;
+                        const int globalChannel = c + lo * ratio + i;
+                        if (globalChannel < channels) {
+                            channel_buff[indexChannel * loc_sites + ls]
+                                = vload_net_t((batch * channels + globalChannel) * NUM_INTERSECTIONS + inter, in);
+                        }
+                    }
                 }
-                out_cw  += row_buff_size;
-                out_lane = 0;
-           }
-       }
-    }
+            }
 
-__kernel void merge(
-                        __global const net_t * restrict means,
-                        __global const net_t * restrict stdevs,
-                        __global const net_t * restrict in,
-                        __global net_t * restrict out,
-                        __private const int channels,
-                        __private const int add_origin) {
-        // cl::NDRange global(outputs, NUM_INTERSECTIONS);
-        const int gx = get_global_id(0);
-        const int gy = get_global_id(1);
-        const int batch = get_global_id(2);
-        const int output = gx;
-        const int b = gy;
-        const int outputs = get_global_size(0);
-        const int width = BOARD_SIZE;
-        const int height = BOARD_SIZE;
-        const int o = output;
-        real sum = 0;
-        for (int c = 0; c < channels; c++) {
-            sum += vload_net_t(batch * channels * NUM_INTERSECTIONS * outputs +
-                (c * NUM_INTERSECTIONS + b) * outputs + o, in);
-        }
-        real mean = vload_net_t(o, means);
-        real stdev = vload_net_t(o, stdevs);
-        sum = (sum - mean) * stdev;       // Batch normalization
-        if (add_origin) {
-            sum += vload_net_t(batch * outputs * NUM_INTERSECTIONS + o * NUM_INTERSECTIONS + b, out);
-        }
-        sum = sum > ZERO ? sum : ZERO;    // ReLU
-        vstore_net_t(sum, batch * outputs * NUM_INTERSECTIONS + o * NUM_INTERSECTIONS + b, out);
-    }
+            // Copy the filter we are applying locally
+            if (o < outputs) {
+                const int indexChannel = lc + ls;
+                const int globalChannel = c + ls;
+                if (num_mults_item <= loc_sites) {
+                    // Values of 'ls' are enough to copy the filter data one location per item
+                    if (ls < num_mults_item && globalChannel < channels) {
+                        filter_buff[lo * loc_channels + indexChannel]
+                            = vload_net_t(o * channels + globalChannel, weights);
+                    }
+                } else {
+                    // Values of 'ls' are not enough: each item will copy the same share of filter values
+                    const int ratio = num_mults_item / loc_sites; // always a power of 2
+#pragma unroll
+                    for (int i = 0; i < ratio; ++i) {
+                        const int indexChannel = lc + ls * ratio + i;
+                        const int globalChannel = c + ls * ratio + i;
+                        if (globalChannel < channels) {
+                            filter_buff[lo * loc_channels + indexChannel]
+                                = vload_net_t(o * channels + globalChannel, weights);
+                        }
+                    }
+                }
+            }
 
+            barrier(CLK_LOCAL_MEM_FENCE);
+
+            // run the num_mults_item operations of this item and put them in the local merge_buffer
+            if (s < sites && o < outputs) {
+
+#pragma unroll
+                for (int i = 0; i < num_mults_item; ++i) {
+                    const int indexChannel = lc + i;
+                    const int globalChannel = c + i;
+                    if (globalChannel < channels) {
+                        val += filter_buff[lo * loc_channels + indexChannel] * channel_buff[indexChannel * loc_sites + ls];
+                    }
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+
+        const int merge_buff_offset   = (ls * loc_outputs + lo) * loc_num_items_a_c;
+        merge_buff[merge_buff_offset + lci] = val;
+
+        if (lci == 0 && o < outputs) {
+            if (ls == 0) {
+                filter_buff[2 * lo] = vload_net_t(o, means);
+            }
+            if (ls == 1) {
+                filter_buff[2 * lo + 1] = vload_net_t(o, stdevs);
+            }
+        }
+
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+
+        // after all items have fillted their result in the merge_buffer
+        // run the merge at work-group level and store the result in global memory
+        if (lci == 0 && s < sites && o < outputs) {
+            real sum = 0;
+            
+#pragma unroll
+            for (int i = 0; i < loc_num_items_a_c; ++i) {
+                sum += merge_buff[merge_buff_offset + i];
+            }
+
+            const real mean  = filter_buff[2*lo];
+            const real stdev = filter_buff[2*lo+1];
+
+            sum = (sum - mean) * stdev;       // Batch normalization
+
+            const int out_offset = (batch * outputs + o) * NUM_INTERSECTIONS + inter;
+            if (add_origin) {
+                sum += vload_net_t(out_offset, out);
+            }
+            sum = sum > ZERO ? sum : ZERO;    // ReLU
+
+            vstore_net_t(sum, out_offset, out);
+        }
+    }
+    
+
+#if 0
+    __kernel
+    __attribute__((work_group_size_hint(32, 4, 1)))
+    void merge(
+               __global const net_t * restrict means,
+               __global const net_t * restrict stdevs,
+               __global const net_t * restrict mrg,
+               __global net_t * restrict out,
+               __local real * bn_buff,
+               __private const int4 sizes,
+               __private const int add_origin) {
+        
+        // cl::NDRange(ceilMultiple(sites, loc_merge_sites), outputs, 1),
+        // cl::NDRange(loc_merge_sites, loc_merge_outputs, 1));
+
+        const int s  = get_global_id(0);
+        const int o  = get_global_id(1);
+
+        const int ls = get_local_id(0);
+        const int lo = get_local_id(1);
+
+        const int sites          = sizes.s0;
+        const int outputs        = sizes.s1;
+        const int merge_size_a_c = sizes.s3;
+
+        if (s < sites) { // this is redundant!
+            if (ls == 2 * lo) {
+                bn_buff[ls] = vload_net_t(o, means);
+            }
+            if (ls == 2*lo + 1) {
+                bn_buff[ls] = vload_net_t(o, stdevs);
+            }
+        }
+            
+        barrier(CLK_LOCAL_MEM_FENCE);
+
+        if (s < sites && o < outputs) { // o < outputs is redundant!
+            real sum = 0;
+            
+#pragma unroll
+            for (int i = 0; i < merge_size_a_c; ++i) {
+                sum += vload_net_t((o * sites + s) * merge_size_a_c + i, mrg);
+            }
+
+            const real mean  = bn_buff[2*lo];
+            const real stdev = bn_buff[2*lo+1];
+
+            sum = (sum - mean) * stdev;       // Batch normalization
+
+            const int inter  = s % NUM_INTERSECTIONS;
+            const int batch  = s / NUM_INTERSECTIONS;
+
+            const int out_offset = (batch * outputs + o) * NUM_INTERSECTIONS + inter;
+            if (add_origin) {
+                sum += vload_net_t(out_offset, out);
+            }
+            sum = sum > ZERO ? sum : ZERO;    // ReLU
+
+            vstore_net_t(sum, out_offset, out);
+        }
+    }
+#endif
 // End of the C++11 raw string literal
 )"
