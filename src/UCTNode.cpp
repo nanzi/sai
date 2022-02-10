@@ -304,6 +304,17 @@ void UCTNode::update_gxx_sums(std::atomic<float> &old_gxgp_sum,
     atomic_add(old_gp_sum, gp_term);
 }
 
+float UCTNode::get_beta_tree() const {
+    const auto visits = static_cast<int>(m_quantile_updates);
+    if (visits <= 8) {
+        return get_beta_median();
+    }
+
+    const auto sum_derivatives = static_cast<float>(m_gp_sum_one);
+    return 4.0f * sum_derivatives / visits;
+}
+
+
 void UCTNode::update_quantile(std::atomic<float> &old_quantile,
                               float old_gxgp_sum, float old_gp_sum,
                               float parameter, int new_visits, float avg_pi,
@@ -897,7 +908,7 @@ UCTStats UCTNode::get_uct_stats() const {
     UCTStats stats;
 
     stats.alpkt_tree = -m_quantile_one;
-    stats.beta_median = get_beta_median();
+    stats.beta_tree = get_beta_tree();
     stats.azwinrate_avg = get_azwinrate_avg();
     return stats;
 }
@@ -940,7 +951,7 @@ void UCTNode::wait_expanded() {
 }
 
 StateEval UCTNode::state_eval() const {
-    StateEval ev(get_visits(), m_net_alpkt, m_net_beta, m_net_pi,
+    StateEval ev(get_visits(), m_net_alpkt, get_beta_tree(), m_net_pi,
                  m_quantile_lambda, m_quantile_mu,
                  get_eval(), -m_quantile_one);
     return ev;

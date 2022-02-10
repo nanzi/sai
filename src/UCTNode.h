@@ -48,7 +48,7 @@
 
 struct UCTStats {
     float alpkt_tree;
-    float beta_median;
+    float beta_tree;
     float azwinrate_avg;
 };
 
@@ -135,6 +135,7 @@ public:
     UCTNode* select_child(int move);
     float estimate_alpkt(int passes, bool is_tromptaylor_scoring = false) const;
     float get_beta_median() const;
+    float get_beta_tree() const;
     float get_azwinrate_avg() const;
     UCTStats get_uct_stats() const;
     void update_quantile(std::atomic<float> &old_quantile, float old_gxgp_sum,

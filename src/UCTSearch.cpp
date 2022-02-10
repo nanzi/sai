@@ -449,7 +449,7 @@ void UCTSearch::dump_stats(FastState & state, UCTNode & parent,
     }
 
 #ifdef NDEBUG
-    myprintf("move  visits reuse ppv winrate  agent   LCB   stdev policy fvisit alpkt w1st PV\n\n");
+    myprintf("move  visits reuse ppv winrate  agent   LCB   stdev policy fvisit alpkt beta w1st PV\n\n");
 #endif
     // Some global quantities are required for plays_per_visit
     auto total_policy = 0.0;
@@ -503,7 +503,7 @@ void UCTSearch::dump_stats(FastState & state, UCTNode & parent,
             max_raw_eval = std::max(max_raw_eval, node->get_raw_eval(color));
         }
 
-        myprintf("%4s %7d %5d %3d  %5.2f%% %5.2f%% %5.*f%% %5.2f%% %5.2f%% %5.2f%% %5.1f %3.0f%% %s\n",
+        myprintf("%4s %7d %5d %3d  %5.2f%% %5.2f%% %5.*f%% %5.2f%% %5.2f%% %5.2f%% %5.1f %5.3f %2.0f%% %s\n",
                  move.c_str(),
                  node->get_visits(),
                  initial_visits.at(node->get_move()),
@@ -516,6 +516,7 @@ void UCTSearch::dump_stats(FastState & state, UCTNode & parent,
                  node->get_policy() * 100.0f,
                  node->get_visits() / float(parent.get_visits()) * 100.0f,
                  -node->get_quantile_one(),
+                 node->get_beta_tree(),
                  fracmax * 100.0f,
                  pv.c_str());
 #ifndef NDEBUG
@@ -542,18 +543,20 @@ void UCTSearch::dump_stats(FastState & state, UCTNode & parent,
         if (node->get_visits()) {
             avg_eval_this_agent += node->get_visits() * node->get_raw_eval(color);
             total_visits += node->get_visits();
-            policy_loss -= node->get_visits() * std::log(double(node->get_policy()));
-            raw_eval_inefficiency += node->get_visits() * std::max(0.0f, max_raw_eval - node->get_raw_eval(color));
+            policy_loss -= node->get_visits() * (std::log(double(node->get_policy()))
+                                                 - std::log(double(node->get_visits())));
+            raw_eval_inefficiency += node->get_visits()
+                                     * std::max(0.0f, max_raw_eval - node->get_raw_eval(color));
         }
     }
     avg_eval_this_agent /= total_visits;
-    policy_loss /= total_visits;
+    policy_loss = policy_loss / total_visits - std::log(double(total_visits));
     raw_eval_inefficiency /= total_visits;
     myprintf("\n      visits reuse  de winrate  agent parent  stdev p_loss  ineff alpkt beta");
-    myprintf("\nRoot %7d %5d %3d  %5.2f%% %5.2f%% %5.2f%% %5.2f%% %5.2f  %5.2f%% %5.1f %4.2f\n\n",
+    myprintf("\nRoot %7d %5d %3d  %5.2f%% %5.2f%% %5.2f%% %5.2f%% %5.2f  %5.2f%% %5.1f %5.3f\n\n",
              parent.get_visits(),
              initial_visits_parent,
-             min_ppv_2nd - min_ppv_1st,
+             std::min(999, min_ppv_2nd - min_ppv_1st),
              parent.get_avg_pi(color)*100.0f,
              avg_eval_this_agent*100.0f,
              parent.get_raw_eval(color)*100.0f,
@@ -564,7 +567,7 @@ void UCTSearch::dump_stats(FastState & state, UCTNode & parent,
              policy_loss,
              raw_eval_inefficiency*100.0f,
              -parent.get_quantile_one(),
-             parent.get_beta_median());
+             parent.get_beta_tree());
     auto x = parent.get_quantile_lambda(color);
     auto y = parent.get_quantile_mu(color);
     if (y < x) {
@@ -728,15 +731,29 @@ bool UCTSearch::should_resign(passflag_t passflag, float besteval) {
     }
 
     if (m_network.m_value_head_sai) {
-        if (m_root->get_beta_median() < 1.5) {
+        const auto beta_estimate = m_root->get_beta_tree();
+        if (beta_estimate < 1.5) {
             const auto opp_avgloss = m_rootstate.get_opp_avgloss();
             const auto remaining_moves = std::max(4, int(num_intersections * 0.8f - movenum));
             if (remaining_moves * 0.5 * opp_avgloss > m_root->get_quantile_one() * (color == FastBoard::WHITE ? -1 : 1) ) {
                 return false;
             }
         }
+        // If beta is too low, it might happen that the resign
+        // threshold is crossed when there is still too much
+        // uncertainty in the result, so drop the threshold
+        if (beta_estimate < 0.8 && besteval > 0.25 * resign_threshold) {
+            return false;
+        }
     }
-    return true;
+
+    // Only resign at the second consecutive suggestion
+    const auto resign = m_last_resign_request >= static_cast<int>(movenum) - 2;
+
+    // Store last resign suggestion move number
+    m_last_resign_request = movenum;
+
+    return resign;
 }
 
 int UCTSearch::get_best_move(passflag_t passflag) {
@@ -1336,10 +1353,10 @@ int UCTSearch::think(int color, passflag_t passflag) {
             child_for_score = chosen_child;
 
 #ifndef NDEBUG
-            myprintf("visits=%d, alpkt=%.2f, beta=%.3f, pi=%.3f, "
+            myprintf("visits=%d, alpkt=%.2f, beta_tree=%.3f, pi=%.3f, "
                      "avg=%.3f, alpkt_tree=%.3f, "
                      "x_mu=%.1f, x_lambda=%.1f\n",
-                     ev.visits, ev.alpkt, ev.beta, ev.pi,
+                     ev.visits, ev.alpkt, ev.beta_tree, ev.pi,
                      ev.agent_eval_avg, ev.alpkt_tree,
                      ev.agent_x_mu, ev.agent_x_lambda);
 #endif

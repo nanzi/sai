@@ -370,10 +370,10 @@ std::string GameState::eval_comment(bool print_header) const {
 
     if (print_header) {
         comstr << "alpkt_tree" << ", "
-               << "alpkt" << ", "
-               << "beta" << ", "
-               << "pi" << ", "
+               << "beta_tree" << ", "
                << "agent_eval_avg" << ", "
+               << "pi" << ", "
+               << "alpkt" << ", "
                << "quantile_lambda" << ", "
                << "quantile_mu" << ", "
                << "bitfield";
@@ -381,10 +381,10 @@ std::string GameState::eval_comment(bool print_header) const {
         const auto ev = get_state_eval();
         comstr << std::setprecision(3)
                << ev.alpkt_tree << ", "
-               << ev.alpkt << ", "
-               << ev.beta << ", "
-               << ev.pi << ", "
+               << ev.beta_tree << ", "
                << ev.agent_eval_avg << ", "
+               << ev.pi << ", "
+               << ev.alpkt << ", "
                << ev.agent_x_lambda << ", "
                << ev.agent_x_mu << ", "
                << flags_to_text();

@@ -225,6 +225,7 @@ private:
     int m_stopping_visits = 0;
     bool m_stopping_flag = false;
     bool m_nopass = false;
+    int m_last_resign_request = -1;
 
     int m_bestmove = FastBoard::PASS;
 

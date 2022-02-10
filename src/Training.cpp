@@ -328,7 +328,7 @@ void Training::dump_training(int winner_color,
             out << "0";
         }
         out << " " << it->uct_stats.alpkt_tree
-            << " " << it->uct_stats.beta_median
+            << " " << it->uct_stats.beta_tree
             << " " << it->uct_stats.azwinrate_avg
             << std::endl;
         training_str.append(out.str());
