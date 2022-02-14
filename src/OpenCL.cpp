@@ -54,9 +54,9 @@
 using namespace Utils;
 
 static constexpr auto LOG2_NUM_ITEMS_PER_WG   = 8;
-static constexpr auto LOG2_NUM_CHANS_PER_WG   = 5;
+static constexpr auto LOG2_NUM_CHANS_PER_WG   = 4;
 static constexpr auto LOG2_NUM_OUTPUTS_PER_WG = 4;
-static constexpr auto LOG2_NUM_MULTS_PER_ITEM = 5;
+static constexpr auto LOG2_NUM_MULTS_PER_ITEM = 4;
 
 
 template <typename net_t> static std::string getClArgs();
