@@ -45,9 +45,9 @@ public:
     ~Job() = default;
     virtual Result execute() = 0;
     virtual void init(const Order &o);
-    void finish() { m_state.storeRelaxed(FINISHING); }
+    void finish() { m_state.storeRelease(FINISHING); }
     void store() {
-        m_state.storeRelaxed(STORING);
+        m_state.storeRelease(STORING);
     }
 
 protected:
