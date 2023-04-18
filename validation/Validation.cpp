@@ -127,7 +127,7 @@ void ValidationWorker::init(const QString& gpuIndex,
     }
     m_expected = expected;
     m_keepPath = keep;
-    m_state.storeRelaxed(RUNNING);
+    m_state.storeRelease(RUNNING);
 }
 
 Validation::Validation(const int gpus,
