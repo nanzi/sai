@@ -20,6 +20,16 @@
 #include <QFile>
 #include <QDir>
 #include <QUuid>
+#include <QtGlobal>
+#include <QString>
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 14, 0)
+namespace Qt
+{
+    static auto endl = ::endl;
+    static auto SkipEmptyParts = QString::SkipEmptyParts;
+}
+#endif
 
 using VersionTuple = std::tuple<int, int, int>;
 // Minimal Leela Zero version we expect to see
@@ -64,9 +74,9 @@ void ValidationWorker::run() {
             second.readMove();
             first.setMove(wmove + second.getMove());
             second.nextMove();
-        } while (first.nextMove() && m_state.loadRelaxed() == RUNNING);
+        } while (first.nextMove() && m_state.load() == RUNNING);
 
-        if (m_state.loadRelaxed() == RUNNING) {
+        if (m_state.load() == RUNNING) {
             QTextStream(stdout) << "Game has ended." << Qt::endl;
             int result = 0;
             if (first.getScore()) {
