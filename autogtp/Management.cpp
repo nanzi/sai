@@ -748,7 +748,7 @@ void Management::sendAllGames() {
         try {
             sent = sendCurl(lines);
             if (sent) {
-                QTextStream(stdout) << "File: " << file.fileName() << " sent" << Qt::endl;
+                QTextStream(stdout) << "File: " << file.fileName() << " sent" << endl;
                 file.remove();
                 cleanupFiles(name);
                 if (i+1 < list.size()) {
@@ -757,12 +757,12 @@ void Management::sendAllGames() {
             }
         } catch (const NetworkException &ex) {
             QTextStream(stdout)
-                << "Network connection to server failed." << Qt::endl;
+                << "Network connection to server failed." << endl;
             QTextStream(stdout)
-                << ex.what() << Qt::endl;
+                << ex.what() << endl;
             QTextStream(stdout)
                     << "Retrying when next game is finished."
-                    << Qt::endl;
+                    << endl;
         }
     }
 }
@@ -786,7 +786,7 @@ bool Management::sendCurl(const QStringList &lines, const QStringList &args) {
     curl.waitForFinished(-1);
     if (curl.exitCode()) {
         QTextStream(stdout) << "Upload failed. Curl Exit code: "
-            << curl.exitCode() << Qt::endl;
+            << curl.exitCode() << endl;
         QTextStream(stdout) << curl.readAllStandardOutput();
         throw NetworkException("Curl returned non-zero exit code "
                                    + std::to_string(curl.exitCode()));
@@ -811,7 +811,7 @@ https://zero.sjeng.org/submit-match
 
 void Management::uploadResult(const QMap<QString,QString> &r, const QMap<QString,QString> &l) {
     QTextStream(stdout) << "Uploading match: " << r["file"] << ".sgf for networks ";
-    QTextStream(stdout) << l["firstNet"] << " and " << l["secondNet"] << Qt::endl;
+    QTextStream(stdout) << l["firstNet"] << " and " << l["secondNet"] << endl;
     archiveFiles(r["file"]);
     gzipFile(r["file"] + ".sgf");
     QStringList prog_cmdline;
