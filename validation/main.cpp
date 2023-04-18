@@ -31,6 +31,16 @@
 #include "../autogtp/Game.h"
 #include "../autogtp/Console.h"
 #include "Validation.h"
+#include <QtGlobal>
+#include <QString>
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 14, 0)
+namespace Qt
+{
+    static auto endl = ::endl;
+    static auto SkipEmptyParts = QString::SkipEmptyParts;
+}
+#endif
 
 constexpr int VALIDATION_VERSION = 1;
 
