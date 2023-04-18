@@ -23,6 +23,16 @@
 #include <QRegularExpression>
 #include <QFileInfo>
 #include "Game.h"
+#include <QtGlobal>
+#include <QString>
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 14, 0)
+namespace Qt
+{
+    static auto endl = ::endl;
+    static auto SkipEmptyParts = QString::SkipEmptyParts;
+}
+#endif
 
 Game::Game(const Engine& engine) :
     QProcess(),
