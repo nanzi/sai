@@ -252,7 +252,7 @@ void  Management::printTimingInfo(float duration) {
         << m_matchGames << " matches) played in "
         << total_time_min.count() << " minutes = "
         << total_time_s.count() / m_gamesPlayed << " seconds/game, "
-        << total_time_millis.count() / m_movesMade.loadRelaxed()  << " ms/move"
+        << total_time_millis.count() / m_movesMade.load()  << " ms/move"
         << ", last game took " << int(duration) << " seconds." << Qt::endl;
 }
 
