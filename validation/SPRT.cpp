@@ -22,6 +22,16 @@
 #include <cmath>
 #include <iostream>
 #include <QtGlobal>
+#include <QtGlobal>
+#include <QString>
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 14, 0)
+namespace Qt
+{
+    static auto endl = ::endl;
+    static auto SkipEmptyParts = QString::SkipEmptyParts;
+}
+#endif
 
 class BayesElo;
 class SprtProbability;
