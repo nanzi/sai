@@ -25,6 +25,16 @@
 
 #include <QFile>
 #include <QThread>
+#include <QtGlobal>
+#include <QString>
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 14, 0)
+namespace Qt
+{
+    static auto endl = ::endl;
+    static auto SkipEmptyParts = QString::SkipEmptyParts;
+}
+#endif
 
 Job::Job(QString gpu, Management *parent) :
     m_state(RUNNING),
@@ -94,8 +104,8 @@ Result ProductionJob::execute(){
         }
         game.readMove();
         m_boss->incMoves();
-    } while (game.nextMove() && m_state.loadRelaxed() == RUNNING);
-    switch (m_state.loadRelaxed()) {
+    } while (game.nextMove() && m_state.load() == RUNNING);
+    switch (m_state.load()) {
     case RUNNING:
         QTextStream(stdout) << "Game has ended." << Qt::endl;
         if (game.getScore()) {
@@ -175,9 +185,9 @@ Result ValidationJob::execute(){
         gameToMove->readMove();
         m_boss->incMoves();
         gameOpponent->setMove("play " + *colorToMove + " " + gameToMove->getMove());
-    } while (gameToMove->nextMove() && m_state.loadRelaxed() == RUNNING);
+    } while (gameToMove->nextMove() && m_state.load() == RUNNING);
 
-    switch (m_state.loadRelaxed()) {
+    switch (m_state.load()) {
     case RUNNING:
         QTextStream(stdout) << "Game has ended." << Qt::endl;
         if (first.getScore()) {
