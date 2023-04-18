@@ -21,6 +21,16 @@
 #include "SPRT.h"
 #include <QString>
 #include <iostream>
+#include <QtGlobal>
+#include <QString>
+
+#if QT_VERSION < QT_VERSION_CHECK(5, 14, 0)
+namespace Qt
+{
+    static auto endl = ::endl;
+    static auto SkipEmptyParts = QString::SkipEmptyParts;
+}
+#endif
 
 void Results::addGameResult(Sprt::GameResult result, int side) {
     m_gamesPlayed++;
