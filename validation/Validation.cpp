@@ -113,7 +113,7 @@ void ValidationWorker::run() {
             first.gameQuit();
             second.gameQuit();
         }
-    } while (m_state.loadRelaxed() != FINISHING);
+    } while (m_state.load() != FINISHING);
 }
 
 void ValidationWorker::init(const QString& gpuIndex,
