@@ -39,7 +39,7 @@ Worker::Worker(int index, const QString& gpuIndex, Management *parent) :
 void Worker::doStore() {
     QTextStream(stdout) << "Storing current game ..." << Qt::endl;
     m_job->store();
-    m_state.storeRelaxed(STORING);
+    m_state.storeRelease(STORING);
 }
 
 void Worker::order(Order o)
