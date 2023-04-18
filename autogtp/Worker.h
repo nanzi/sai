@@ -38,7 +38,7 @@ public:
     Worker(int index, const QString& gpuIndex, Management *parent);
     ~Worker() = default;
     void order(Order o);
-    void doFinish() { m_job->finish(); m_state.storeRelaxed(FINISHING); }
+    void doFinish() { m_job->finish(); m_state.storeRelease(FINISHING); }
     void doStore();
     void run() override;
 signals:
